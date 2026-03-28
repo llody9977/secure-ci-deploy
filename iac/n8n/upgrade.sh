@@ -13,6 +13,45 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="$SCRIPT_DIR/upgrade.log"
 ENV_FILE="$SCRIPT_DIR/.env"
 
+get_env_value() {
+    local key="$1"
+    awk -F '=' -v search_key="$key" '$1 == search_key {print substr($0, index($0, "=") + 1); exit}' "$ENV_FILE"
+}
+
+resolve_repo_slug() {
+    local remote_url slug env_owner env_repo
+
+    env_owner="$(get_env_value "GITHUB_REPOSITORY_OWNER_LC")"
+    env_repo="$(get_env_value "REPOSITORY_NAME")"
+    if [ -n "$env_owner" ] && [ -n "$env_repo" ]; then
+        printf '%s/%s\n' "$env_owner" "$env_repo"
+        return 0
+    fi
+
+    if [ -n "${GITHUB_REPOSITORY:-}" ]; then
+        printf '%s\n' "$GITHUB_REPOSITORY"
+        return 0
+    fi
+
+    remote_url="$(git -C "$SCRIPT_DIR" config --get remote.origin.url 2>/dev/null || true)"
+    case "$remote_url" in
+        git@github.com:*)
+            slug="${remote_url#git@github.com:}"
+            ;;
+        https://github.com/*)
+            slug="${remote_url#https://github.com/}"
+            ;;
+        *)
+            slug=""
+            ;;
+    esac
+
+    slug="${slug%.git}"
+    if [ -n "$slug" ]; then
+        printf '%s\n' "$slug"
+    fi
+}
+
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
 }
@@ -37,11 +76,17 @@ if [ ! -f "$ENV_FILE" ]; then
     exit 0
 fi
 
+REPO_SLUG="$(resolve_repo_slug)"
+if [ -z "$REPO_SLUG" ]; then
+    log "⚠️  Could not determine the GitHub repository owner/name. Skipping."
+    exit 0
+fi
+
 # ─── RESOLVE VERSIONS ────────────────────────────────────────────────────────
 CURRENT_VERSION=$(grep '^N8N_IMAGE_VERSION=' "$ENV_FILE" | cut -d '=' -f 2- | tr -d '[:space:]')
 log "Current deployed version: $CURRENT_VERSION"
 
-LATEST_VERSION=$(gh release list --repo llody9977/secure-ci-deploy --limit 20 --json tagName \
+LATEST_VERSION=$(gh release list --repo "$REPO_SLUG" --limit 20 --json tagName \
     | jq -r '.[].tagName' | grep -E '^n8n-[0-9]+\.[0-9]+\.[0-9]+$' \
     | sed 's/^n8n-//' | sort -V | tail -1)
 
@@ -66,7 +111,7 @@ log "Saving rollback state: $PREV_IDENTIFIER (version $PREV_VERSION)"
 
 # ─── FETCH DIGEST FOR NEW VERSION ────────────────────────────────────────────
 RELEASE_TAG="n8n-${LATEST_VERSION}"
-RELEASE_BODY=$(gh release view "$RELEASE_TAG" --repo llody9977/secure-ci-deploy --json body -q '.body' 2>/dev/null || echo "")
+RELEASE_BODY=$(gh release view "$RELEASE_TAG" --repo "$REPO_SLUG" --json body -q '.body' 2>/dev/null || echo "")
 NEW_DIGEST=$(echo "$RELEASE_BODY" | grep -oP 'sha256:[a-f0-9]{64}' | head -1)
 
 if [ -n "$NEW_DIGEST" ]; then

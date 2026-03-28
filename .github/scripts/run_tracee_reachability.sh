@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -lt 2 ] || [ "$#" -gt 4 ]; then
-  echo "Usage: run_tracee_reachability.sh <image_ref> <output_dir> [container_name] [host_port]" >&2
+if [ "$#" -lt 2 ] || [ "$#" -gt 5 ]; then
+  echo "Usage: run_tracee_reachability.sh <image_ref> <output_dir> [container_name] [host_port] [container_port]" >&2
   exit 1
 fi
 
 IMAGE_REF="$1"
 OUTPUT_DIR="$2"
 CONTAINER_NAME="${3:-tracee-smoke}"
-HOST_PORT="${4:-15678}"
+HOST_PORT="${4:-${TRACEE_HOST_PORT:-15678}}"
+CONTAINER_PORT="${5:-${TRACEE_CONTAINER_PORT:-5678}}"
 TRACEE_NAME="tracee-runtime-monitor"
+DOCKER_SOCKET_PATH="${DOCKER_SOCKET_PATH:-}"
+
+if [ -z "$DOCKER_SOCKET_PATH" ]; then
+  DOCKER_SOCKET_PATH="$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)"
+  DOCKER_SOCKET_PATH="${DOCKER_SOCKET_PATH#unix://}"
+fi
+DOCKER_SOCKET_PATH="${DOCKER_SOCKET_PATH:-/var/run/docker.sock}"
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -29,7 +37,7 @@ docker run -d \
   --cgroupns=host \
   --privileged \
   -v /etc/os-release:/etc/os-release-host:ro \
-  -v /var/run:/var/run:ro \
+  -v "$DOCKER_SOCKET_PATH:/var/run/docker.sock:ro" \
   -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
   -v "$OUTPUT_DIR:/output" \
   aquasec/tracee:latest \
@@ -48,7 +56,7 @@ sleep 5
 
 docker run -d \
   --name "$CONTAINER_NAME" \
-  -p "${HOST_PORT}:5678" \
+  -p "${HOST_PORT}:${CONTAINER_PORT}" \
   "$IMAGE_REF" >/dev/null
 
 TARGET_CONTAINER_ID="$(docker inspect --format '{{.Id}}' "$CONTAINER_NAME")"

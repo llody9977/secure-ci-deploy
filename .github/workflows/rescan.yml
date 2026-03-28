@@ -1,5 +1,9 @@
 name: Continuous Re-Scan (Image Lifecycle)
 
+env:
+  TRACEE_HOST_PORT: '15679'
+  TRACEE_CONTAINER_PORT: '5678'
+
 # Runs weekly to detect when the latest promoted image becomes ineligible under
 # the current age/KEV/EPSS promotion policy.
 on:
@@ -120,7 +124,7 @@ jobs:
           chmod +x .github/scripts/collect_package_files.sh .github/scripts/run_tracee_reachability.sh
           mkdir -p "tracee-$VERSION"
           .github/scripts/collect_package_files.sh "$IMAGE" "rescan-$VERSION.raw.json" "tracee-$VERSION/package-files.tsv"
-          .github/scripts/run_tracee_reachability.sh "$IMAGE" "$PWD/tracee-$VERSION" "tracee-rescan-$VERSION-${{ github.run_id }}" 15679
+          .github/scripts/run_tracee_reachability.sh "$IMAGE" "$PWD/tracee-$VERSION" "tracee-rescan-$VERSION-${{ github.run_id }}" "${{ env.TRACEE_HOST_PORT }}" "${{ env.TRACEE_CONTAINER_PORT }}"
           python3 .github/scripts/merge_tracee_reachability.py \
             "rescan-$VERSION.raw.json" \
             "tracee-$VERSION/package-files.tsv" \
@@ -194,7 +198,7 @@ jobs:
 
           **Action required**: Review the findings below and decide whether to:
           1. Promote a newer clean version via the Image Promotion pipeline
-          2. Revoke the affected image from deployment (update \`N8N_IMAGE_DIGEST\` on hosts)
+          2. Revoke the affected image from deployment (update \`N8N_IMAGE_IDENTIFIER\` on hosts)
 
           $ALERT_BODY
 

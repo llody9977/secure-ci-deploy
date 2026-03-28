@@ -10,6 +10,8 @@ on:
 
 env:
   N8N_VERSION: ${{ github.event.inputs.n8n_version || 'latest' }}
+  TRACEE_HOST_PORT: '15678'
+  TRACEE_CONTAINER_PORT: '5678'
 
 jobs:
   scan-images:
@@ -59,7 +61,7 @@ jobs:
 
           # Enforce tag pattern (skip if 'latest' — will be resolved to semver in next step)
           if [ "$REQUESTED_VERSION" != "latest" ]; then
-            if ! echo "$REQUESTED_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            if ! echo "$REQUESTED_VERSION" | grep -qE "$TAG_PATTERN"; then
               echo "❌ POLICY VIOLATION: Tag '$REQUESTED_VERSION' does not match semver pattern. Moving targets (stable, nightly, etc.) are not permitted."
               exit 1
             fi
@@ -201,7 +203,7 @@ jobs:
           chmod +x .github/scripts/collect_package_files.sh .github/scripts/run_tracee_reachability.sh
           mkdir -p tracee-output
           .github/scripts/collect_package_files.sh "n8nio/n8n:${{ env.N8N_VERSION }}" trivy-report.raw.json tracee-output/package-files.tsv
-          .github/scripts/run_tracee_reachability.sh "n8nio/n8n:${{ env.N8N_VERSION }}" "$PWD/tracee-output" "tracee-smoke-${{ github.run_id }}" 15678
+          .github/scripts/run_tracee_reachability.sh "n8nio/n8n:${{ env.N8N_VERSION }}" "$PWD/tracee-output" "tracee-smoke-${{ github.run_id }}" "${{ env.TRACEE_HOST_PORT }}" "${{ env.TRACEE_CONTAINER_PORT }}"
           python3 .github/scripts/merge_tracee_reachability.py \
             trivy-report.raw.json \
             tracee-output/package-files.tsv \
@@ -475,7 +477,7 @@ jobs:
             Set these values in your `.env` file and run `docker compose up -d`:
             ```
             N8N_IMAGE_VERSION=${{ needs.scan-images.outputs.resolved_version }}
-            N8N_IMAGE_DIGEST=${{ steps.docker_push.outputs.digest }}
+            N8N_IMAGE_IDENTIFIER=@${{ steps.docker_push.outputs.digest }}
             ```
 
       - name: Prune old GitHub releases
@@ -599,7 +601,7 @@ jobs:
             Set these values in your `.env` file and run `docker compose up -d`:
             ```
             N8N_IMAGE_VERSION=${{ needs.scan-images.outputs.resolved_version }}
-            N8N_IMAGE_DIGEST=${{ steps.docker_push.outputs.digest }}
+            N8N_IMAGE_IDENTIFIER=@${{ steps.docker_push.outputs.digest }}
             ```
 
       - name: Prune old GitHub releases

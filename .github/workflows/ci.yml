@@ -1,5 +1,10 @@
 name: CI Scan
 
+env:
+  TEST_IMAGE: n8nio/n8n:latest
+  TRACEE_HOST_PORT: "15678"
+  TRACEE_CONTAINER_PORT: "5678"
+
 on:
   push:
     branches:
@@ -124,7 +129,7 @@ jobs:
 
       - name: Pull test image
         run: |
-          docker pull n8nio/n8n:latest
+          docker pull "${{ env.TEST_IMAGE }}"
 
       - name: Run Trivy image scan
         run: |
@@ -132,15 +137,15 @@ jobs:
             --format json \
             --output trivy-report.raw.json \
             --severity CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN \
-            n8nio/n8n:latest
+            "${{ env.TEST_IMAGE }}"
 
       - name: Collect vulnerable package file map
         run: |
-          .github/scripts/collect_package_files.sh n8nio/n8n:latest trivy-report.raw.json package-files.tsv
+          .github/scripts/collect_package_files.sh "${{ env.TEST_IMAGE }}" trivy-report.raw.json package-files.tsv
 
       - name: Run Tracee smoke trace
         run: |
-          .github/scripts/run_tracee_reachability.sh n8nio/n8n:latest "$PWD/tracee-output" tracee-ci-smoke 15678
+          .github/scripts/run_tracee_reachability.sh "${{ env.TEST_IMAGE }}" "$PWD/tracee-output" tracee-ci-smoke "${{ env.TRACEE_HOST_PORT }}" "${{ env.TRACEE_CONTAINER_PORT }}"
 
       - name: Merge Tracee reachability into scan report
         run: |

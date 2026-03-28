@@ -4,6 +4,64 @@
 # Exit on error
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/.env"
+ENV_TEMPLATE="$SCRIPT_DIR/.env.template"
+
+get_kv_value() {
+    local file="$1"
+    local key="$2"
+
+    [ -f "$file" ] || return 0
+    awk -F '=' -v search_key="$key" '$1 == search_key {print substr($0, index($0, "=") + 1); exit}' "$file"
+}
+
+resolve_repo_slug() {
+    local remote_url slug
+
+    if [ -n "${GITHUB_REPOSITORY:-}" ]; then
+        printf '%s\n' "$GITHUB_REPOSITORY"
+        return 0
+    fi
+
+    remote_url="$(git -C "$SCRIPT_DIR" config --get remote.origin.url 2>/dev/null || true)"
+    case "$remote_url" in
+        git@github.com:*)
+            slug="${remote_url#git@github.com:}"
+            ;;
+        https://github.com/*)
+            slug="${remote_url#https://github.com/}"
+            ;;
+        *)
+            slug=""
+            ;;
+    esac
+
+    slug="${slug%.git}"
+    if [ -n "$slug" ]; then
+        printf '%s\n' "$slug"
+    fi
+}
+
+REPO_SLUG="$(resolve_repo_slug)"
+if [ -z "$REPO_SLUG" ]; then
+    TEMPLATE_OWNER="$(get_kv_value "$ENV_TEMPLATE" "GITHUB_REPOSITORY_OWNER_LC")"
+    TEMPLATE_NAME="$(get_kv_value "$ENV_TEMPLATE" "REPOSITORY_NAME")"
+    if [[ -n "$TEMPLATE_OWNER" && -n "$TEMPLATE_NAME" && "$TEMPLATE_OWNER" != "<github_owner>" && "$TEMPLATE_NAME" != "<repository_name>" ]]; then
+        REPO_SLUG="${TEMPLATE_OWNER}/${TEMPLATE_NAME}"
+    fi
+fi
+
+if [ -z "$REPO_SLUG" ]; then
+    echo "❌ Could not determine the GitHub repository owner/name. Set remote.origin.url or update .env.template."
+    exit 1
+fi
+
+REPO_OWNER="${REPO_SLUG%%/*}"
+REPO_NAME="${REPO_SLUG##*/}"
+GHCR_IMAGE="ghcr.io/${REPO_OWNER}/${REPO_NAME}/n8n-trusted"
+RELEASES_URL="https://github.com/${REPO_SLUG}/releases"
+
 # ─── FLAGS ──────────────────────────────────────────────────────────────────
 # Pass --skip-verify to bypass provenance verification (for automation)
 SKIP_ATTESTATION=false
@@ -37,12 +95,12 @@ echo "✅ Using HOST_IP: $FINAL_IP"
 
 # ─── CHOOSE VERSION ─────────────────────────────────────────────────────────
 echo ""
-echo "Available releases: https://github.com/llody9977/secure-ci-deploy/releases"
+echo "Available releases: ${RELEASES_URL}"
 read -p "Enter the n8n version to deploy (e.g. 1.55.3, or press Enter for latest): " USER_VERSION
 
 if [ -z "$USER_VERSION" ] || [ "$USER_VERSION" = "latest" ]; then
     if command -v gh &> /dev/null && gh auth status &> /dev/null 2>&1; then
-        USER_VERSION=$(gh release list --repo llody9977/secure-ci-deploy --limit 20 --json tagName \
+        USER_VERSION=$(gh release list --repo "$REPO_SLUG" --limit 20 --json tagName \
             | jq -r '.[].tagName' | grep -E '^n8n-[0-9]+\.[0-9]+\.[0-9]+$' \
             | sed 's/^n8n-//' | sort -V | tail -1)
         echo "Resolved latest release: $USER_VERSION"
@@ -83,7 +141,7 @@ echo "---------------------------------------------"
 
 GHCR_DIGEST=""
 if command -v gh &> /dev/null && gh auth status &> /dev/null 2>&1; then
-    RELEASE_BODY=$(gh release view "$RELEASE_TAG" --repo llody9977/secure-ci-deploy --json body -q '.body' 2>/dev/null || echo "")
+    RELEASE_BODY=$(gh release view "$RELEASE_TAG" --repo "$REPO_SLUG" --json body -q '.body' 2>/dev/null || echo "")
     GHCR_DIGEST=$(echo "$RELEASE_BODY" | grep -oP 'sha256:[a-f0-9]{64}' | head -1)
 fi
 
@@ -125,14 +183,14 @@ elif ! command -v gh &> /dev/null || ! gh auth status &> /dev/null 2>&1; then
     echo "   ⚠️  Skipping provenance verification."
 else
     if [ -n "$GHCR_DIGEST" ]; then
-        VERIFY_SUBJECT="oci://ghcr.io/llody9977/secure-ci-deploy/n8n-trusted@${GHCR_DIGEST}"
+        VERIFY_SUBJECT="oci://${GHCR_IMAGE}@${GHCR_DIGEST}"
         echo "Verifying: $VERIFY_SUBJECT"
     else
-        VERIFY_SUBJECT="oci://ghcr.io/llody9977/secure-ci-deploy/n8n-trusted:${N8N_VERSION}"
+        VERIFY_SUBJECT="oci://${GHCR_IMAGE}:${N8N_VERSION}"
         echo "⚠️  No digest available — verifying by tag (weaker guarantee)"
     fi
 
-    if gh attestation verify "$VERIFY_SUBJECT" -o llody9977; then
+    if gh attestation verify "$VERIFY_SUBJECT" -o "$REPO_OWNER"; then
         echo "✅ Provenance verified — image cryptographically bound to this pipeline."
     else
         echo ""
@@ -145,31 +203,40 @@ fi
 
 # ─── WRITE .ENV ─────────────────────────────────────────────────────────────
 PREV_IDENTIFIER=""
+N8N_HOST_PORT="$(get_kv_value "$ENV_FILE" "N8N_HOST_PORT")"
+N8N_CONTAINER_PORT="$(get_kv_value "$ENV_FILE" "N8N_CONTAINER_PORT")"
 
-if [ ! -f .env ]; then
+if [ ! -f "$ENV_FILE" ]; then
     echo ""
     echo "📝 Creating .env file from template..."
-    cp .env.template .env
+    cp "$ENV_TEMPLATE" "$ENV_FILE"
 else
     echo ""
     echo "📝 Updating existing .env file..."
-    PREV_IDENTIFIER=$(grep '^N8N_IMAGE_IDENTIFIER=' .env | cut -d '=' -f 2- || true)
+    PREV_IDENTIFIER=$(grep '^N8N_IMAGE_IDENTIFIER=' "$ENV_FILE" | cut -d '=' -f 2- || true)
 fi
+
+N8N_HOST_PORT=${N8N_HOST_PORT:-5678}
+N8N_CONTAINER_PORT=${N8N_CONTAINER_PORT:-5678}
 
 SED_CMD="sed -i"
 [[ "$OSTYPE" == "darwin"* ]] && SED_CMD="sed -i ''"
 
-$SED_CMD "s/^HOST_IP=.*/HOST_IP=$FINAL_IP/" .env
-$SED_CMD "s/^N8N_IMAGE_VERSION=.*/N8N_IMAGE_VERSION=$N8N_VERSION/" .env
-$SED_CMD "s/^MEM_LIMIT=.*/MEM_LIMIT=$MEM_LIMIT/" .env
-$SED_CMD "s/^CPU_LIMIT=.*/CPU_LIMIT=$CPU_LIMIT/" .env
-$SED_CMD "s/^PIDS_LIMIT=.*/PIDS_LIMIT=$PIDS_LIMIT/" .env
+$SED_CMD "s/^HOST_IP=.*/HOST_IP=$FINAL_IP/" "$ENV_FILE"
+$SED_CMD "s/^GITHUB_REPOSITORY_OWNER_LC=.*/GITHUB_REPOSITORY_OWNER_LC=$REPO_OWNER/" "$ENV_FILE"
+$SED_CMD "s/^REPOSITORY_NAME=.*/REPOSITORY_NAME=$REPO_NAME/" "$ENV_FILE"
+$SED_CMD "s/^N8N_HOST_PORT=.*/N8N_HOST_PORT=$N8N_HOST_PORT/" "$ENV_FILE"
+$SED_CMD "s/^N8N_CONTAINER_PORT=.*/N8N_CONTAINER_PORT=$N8N_CONTAINER_PORT/" "$ENV_FILE"
+$SED_CMD "s/^N8N_IMAGE_VERSION=.*/N8N_IMAGE_VERSION=$N8N_VERSION/" "$ENV_FILE"
+$SED_CMD "s/^MEM_LIMIT=.*/MEM_LIMIT=$MEM_LIMIT/" "$ENV_FILE"
+$SED_CMD "s/^CPU_LIMIT=.*/CPU_LIMIT=$CPU_LIMIT/" "$ENV_FILE"
+$SED_CMD "s/^PIDS_LIMIT=.*/PIDS_LIMIT=$PIDS_LIMIT/" "$ENV_FILE"
 
 if [ -n "$GHCR_DIGEST" ]; then
-    $SED_CMD "s|^N8N_IMAGE_IDENTIFIER=.*|N8N_IMAGE_IDENTIFIER=@$GHCR_DIGEST|" .env
+    $SED_CMD "s|^N8N_IMAGE_IDENTIFIER=.*|N8N_IMAGE_IDENTIFIER=@$GHCR_DIGEST|" "$ENV_FILE"
     echo "✅ Digest written to .env — Docker will run the exact attested image."
 else
-    $SED_CMD "s|^N8N_IMAGE_IDENTIFIER=.*|N8N_IMAGE_IDENTIFIER=:$N8N_VERSION|" .env
+    $SED_CMD "s|^N8N_IMAGE_IDENTIFIER=.*|N8N_IMAGE_IDENTIFIER=:$N8N_VERSION|" "$ENV_FILE"
     echo "⚠️  Fallback tag written to .env — digest pinning disabled."
 fi
 
@@ -189,11 +256,11 @@ if docker ps | grep -q "n8n-trusted"; then
     echo "🎉 SUCCESS! n8n ${N8N_VERSION} deployed."
     echo "============================================="
     echo "🔗 Access your n8n instance at:"
-    echo "http://$FINAL_IP:5678"
+    echo "http://$FINAL_IP:${N8N_HOST_PORT}"
     echo "============================================="
     echo "To view logs: docker compose logs -f"
     if [ -n "$PREV_IDENTIFIER" ]; then
-        echo "To rollback:  $SED_CMD 's|^N8N_IMAGE_IDENTIFIER=.*|N8N_IMAGE_IDENTIFIER=$PREV_IDENTIFIER|' .env && docker compose up -d"
+        echo "To rollback:  $SED_CMD 's|^N8N_IMAGE_IDENTIFIER=.*|N8N_IMAGE_IDENTIFIER=$PREV_IDENTIFIER|' $ENV_FILE && docker compose up -d"
     fi
 else
     echo "⚠️  The container may not have started correctly."
