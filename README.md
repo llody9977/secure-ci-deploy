@@ -62,9 +62,9 @@ To run image promotion manually:
 
 ## Documentation
 
-- [Architecture and trust model](/Users/minato/secure-ci-deploy/docs/architecture-and-trust.md)
-- [Approval gate policy](/Users/minato/secure-ci-deploy/docs/gate-policy.md)
-- [Deployment and operations](/Users/minato/secure-ci-deploy/docs/deployment-and-operations.md)
+- [Architecture and trust model](docs/architecture-and-trust.md)
+- [Approval gate policy](docs/gate-policy.md)
+- [Deployment and operations](docs/deployment-and-operations.md)
 
 ## Repository Structure
 
@@ -79,11 +79,11 @@ To run image promotion manually:
 
 ## Key Paths
 
-- [image-promotion.yml](/Users/minato/secure-ci-deploy/.github/workflows/image-promotion.yml)
-- [rescan.yml](/Users/minato/secure-ci-deploy/.github/workflows/rescan.yml)
-- [docker-compose.yml](/Users/minato/secure-ci-deploy/iac/n8n/docker-compose.yml)
-- [install.sh](/Users/minato/secure-ci-deploy/iac/n8n/install.sh)
-- [upgrade.sh](/Users/minato/secure-ci-deploy/iac/n8n/upgrade.sh)
+- [image-promotion.yml](.github/workflows/image-promotion.yml)
+- [rescan.yml](.github/workflows/rescan.yml)
+- [docker-compose.yml](iac/n8n/docker-compose.yml)
+- [install.sh](iac/n8n/install.sh)
+- [upgrade.sh](iac/n8n/upgrade.sh)
 
 ## References
 

@@ -2,14 +2,14 @@
 
 ## Deployment Assets
 
-The deployment stack lives under [iac/n8n](/Users/minato/secure-ci-deploy/iac/n8n).
+The deployment stack lives under [iac/n8n](../iac/n8n).
 
 Main files:
 
-- [docker-compose.yml](/Users/minato/secure-ci-deploy/iac/n8n/docker-compose.yml)
-- [install.sh](/Users/minato/secure-ci-deploy/iac/n8n/install.sh)
-- [upgrade.sh](/Users/minato/secure-ci-deploy/iac/n8n/upgrade.sh)
-- [.env.template](/Users/minato/secure-ci-deploy/iac/n8n/.env.template)
+- [docker-compose.yml](../iac/n8n/docker-compose.yml)
+- [install.sh](../iac/n8n/install.sh)
+- [upgrade.sh](../iac/n8n/upgrade.sh)
+- [.env.template](../iac/n8n/.env.template)
 
 ## What the Deployment Does
 
