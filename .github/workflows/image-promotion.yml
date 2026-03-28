@@ -348,6 +348,7 @@ jobs:
           UNKNOWN_AGE_REVIEW_COUNT="${{ steps.enrich-findings.outputs.unknown_age_review_count }}"
           VERSION="${{ env.N8N_VERSION }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          ISSUE_TITLE="🚨 n8n $VERSION: manual review required by age/KEV/EPSS gate"
           gh label create security --color "FF0000" --force || true
           cat << 'ISSUE_EOF' > issue_body.md
           ## 🚨 Promotion Alert: Vulnerable Image Requires Review
@@ -369,11 +370,31 @@ jobs:
           ---
           *Triggered by Image Promotion on $(date -u '+%Y-%m-%d')*
           ISSUE_EOF
-          gh issue create \
+          EXISTING_ISSUE_NUMBER=$(gh issue list \
             --repo "${{ github.repository }}" \
-            --title "🚨 n8n $VERSION: manual review required by age/KEV/EPSS gate" \
-            --body-file issue_body.md \
-            --label "security"
+            --state open \
+            --search "$ISSUE_TITLE in:title" \
+            --json number,title \
+            --jq 'map(select(.title == "'"$ISSUE_TITLE"'")) | first.number // empty')
+
+          if [ -n "$EXISTING_ISSUE_NUMBER" ]; then
+            {
+              echo ""
+              echo "---"
+              echo ""
+              cat issue_body.md
+            } > issue_comment.md
+            gh issue comment "$EXISTING_ISSUE_NUMBER" \
+              --repo "${{ github.repository }}" \
+              --body-file issue_comment.md
+            echo "Updated existing issue #$EXISTING_ISSUE_NUMBER instead of creating a duplicate."
+          else
+            gh issue create \
+              --repo "${{ github.repository }}" \
+              --title "$ISSUE_TITLE" \
+              --body-file issue_body.md \
+              --label "security"
+          fi
 
   promote-images-auto:
     name: Auto Promotion (Clean Image)
