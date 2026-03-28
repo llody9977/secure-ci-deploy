@@ -41,6 +41,17 @@ pull_runner_image_for_host() {
     docker pull --platform "$host_platform" "$runner_image" >/dev/null
 }
 
+tag_local_release_image() {
+    local image_ref="$1"
+    local version_tag="$2"
+    local local_tag="ghcr.io/${REPO_SLUG}/n8n-trusted:${version_tag}"
+
+    if docker image inspect "$image_ref" >/dev/null 2>&1; then
+        docker tag "$image_ref" "$local_tag"
+        log "✅ Local convenience tag updated: ${local_tag}"
+    fi
+}
+
 resolve_repo_slug() {
     local remote_url slug env_owner env_repo
 
@@ -153,8 +164,10 @@ $SED_CMD "s/^N8N_IMAGE_VERSION=.*/N8N_IMAGE_VERSION=$LATEST_VERSION/" "$ENV_FILE
 
 if [ -n "$NEW_DIGEST" ]; then
     $SED_CMD "s|^N8N_IMAGE_IDENTIFIER=.*|N8N_IMAGE_IDENTIFIER=@$NEW_DIGEST|" "$ENV_FILE"
+    DEPLOY_IMAGE_REF="ghcr.io/${REPO_SLUG}/n8n-trusted@${NEW_DIGEST}"
 else
     $SED_CMD "s|^N8N_IMAGE_IDENTIFIER=.*|N8N_IMAGE_IDENTIFIER=:$LATEST_VERSION|" "$ENV_FILE"
+    DEPLOY_IMAGE_REF="ghcr.io/${REPO_SLUG}/n8n-trusted:${LATEST_VERSION}"
 fi
 
 cd "$SCRIPT_DIR"
@@ -162,6 +175,7 @@ HOST_PLATFORM="$(get_docker_host_platform)"
 pull_runner_image_for_host "$LATEST_VERSION" "$HOST_PLATFORM"
 docker compose pull 2>&1 | tee -a "$LOG_FILE"
 docker compose up -d 2>&1 | tee -a "$LOG_FILE"
+tag_local_release_image "$DEPLOY_IMAGE_REF" "$LATEST_VERSION"
 
 # ─── HEALTH CHECK ────────────────────────────────────────────────────────────
 log "⏳ Waiting 30s for n8n to start..."

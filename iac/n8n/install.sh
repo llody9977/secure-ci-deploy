@@ -86,6 +86,17 @@ pull_runner_image_for_host() {
     docker pull --platform "$host_platform" "$runner_image" >/dev/null
 }
 
+tag_local_release_image() {
+    local image_ref="$1"
+    local version_tag="$2"
+    local local_tag="${GHCR_IMAGE}:${version_tag}"
+
+    if docker image inspect "$image_ref" >/dev/null 2>&1; then
+        docker tag "$image_ref" "$local_tag"
+        echo "✅ Local convenience tag updated: ${local_tag}"
+    fi
+}
+
 REPO_SLUG="$(resolve_repo_slug)"
 if [ -z "$REPO_SLUG" ]; then
     TEMPLATE_OWNER="$(get_kv_value "$ENV_TEMPLATE" "GITHUB_REPOSITORY_OWNER_LC")"
@@ -289,9 +300,11 @@ $SED_CMD "s|^PIDS_LIMIT=.*|PIDS_LIMIT=$PIDS_LIMIT|" "$ENV_FILE"
 if [ -n "$GHCR_DIGEST" ]; then
     $SED_CMD "s|^N8N_IMAGE_IDENTIFIER=.*|N8N_IMAGE_IDENTIFIER=@$GHCR_DIGEST|" "$ENV_FILE"
     echo "✅ Digest written to .env — Docker will run the exact attested image."
+    DEPLOY_IMAGE_REF="${GHCR_IMAGE}@${GHCR_DIGEST}"
 else
     $SED_CMD "s|^N8N_IMAGE_IDENTIFIER=.*|N8N_IMAGE_IDENTIFIER=:$N8N_VERSION|" "$ENV_FILE"
     echo "⚠️  Fallback tag written to .env — digest pinning disabled."
+    DEPLOY_IMAGE_REF="${GHCR_IMAGE}:${N8N_VERSION}"
 fi
 
 # ─── DEPLOY ─────────────────────────────────────────────────────────────────
@@ -305,6 +318,7 @@ HOST_PLATFORM="$(get_docker_host_platform)"
 pull_runner_image_for_host "$N8N_VERSION" "$HOST_PLATFORM"
 
 docker compose up -d
+tag_local_release_image "$DEPLOY_IMAGE_REF" "$N8N_VERSION"
 
 echo "---------------------------------------------"
 echo "⏳ Waiting for n8n to start..."
