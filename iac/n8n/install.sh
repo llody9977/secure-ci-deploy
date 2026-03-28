@@ -43,6 +43,18 @@ resolve_repo_slug() {
     fi
 }
 
+normalize_memory_limit() {
+    local raw_value="$1"
+
+    if [ -z "$raw_value" ]; then
+        printf '%s\n' "1g"
+    elif [[ "$raw_value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        printf '%s\n' "${raw_value}g"
+    else
+        printf '%s\n' "$raw_value"
+    fi
+}
+
 REPO_SLUG="$(resolve_repo_slug)"
 if [ -z "$REPO_SLUG" ]; then
     TEMPLATE_OWNER="$(get_kv_value "$ENV_TEMPLATE" "GITHUB_REPOSITORY_OWNER_LC")"
@@ -121,8 +133,8 @@ echo "These limits cap the blast radius if the container is compromised."
 echo "Press Enter to accept the defaults."
 echo ""
 
-read -p "Memory limit (e.g. 512m, 1g, 2g) [default: 1g]: " INPUT_MEM
-MEM_LIMIT=${INPUT_MEM:-1g}
+read -p "Memory limit in GB by default (e.g. 1, 2, 512m, 1g) [default: 1g]: " INPUT_MEM
+MEM_LIMIT="$(normalize_memory_limit "$INPUT_MEM")"
 
 read -p "CPU limit (e.g. 0.5, 1.0, 2.0) [default: 1.0]: " INPUT_CPU
 CPU_LIMIT=${INPUT_CPU:-1.0}
