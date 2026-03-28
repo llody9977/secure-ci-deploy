@@ -142,7 +142,7 @@ echo "---------------------------------------------"
 GHCR_DIGEST=""
 if command -v gh &> /dev/null && gh auth status &> /dev/null 2>&1; then
     RELEASE_BODY=$(gh release view "$RELEASE_TAG" --repo "$REPO_SLUG" --json body -q '.body' 2>/dev/null || echo "")
-    GHCR_DIGEST=$(echo "$RELEASE_BODY" | grep -oP 'sha256:[a-f0-9]{64}' | head -1)
+    GHCR_DIGEST=$(printf '%s\n' "$RELEASE_BODY" | grep -Eo 'sha256:[[:xdigit:]]{64}' | head -1)
 fi
 
 if [ -z "$GHCR_DIGEST" ]; then

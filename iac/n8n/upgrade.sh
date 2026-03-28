@@ -112,7 +112,7 @@ log "Saving rollback state: $PREV_IDENTIFIER (version $PREV_VERSION)"
 # ─── FETCH DIGEST FOR NEW VERSION ────────────────────────────────────────────
 RELEASE_TAG="n8n-${LATEST_VERSION}"
 RELEASE_BODY=$(gh release view "$RELEASE_TAG" --repo "$REPO_SLUG" --json body -q '.body' 2>/dev/null || echo "")
-NEW_DIGEST=$(echo "$RELEASE_BODY" | grep -oP 'sha256:[a-f0-9]{64}' | head -1)
+NEW_DIGEST=$(printf '%s\n' "$RELEASE_BODY" | grep -Eo 'sha256:[[:xdigit:]]{64}' | head -1)
 
 if [ -n "$NEW_DIGEST" ]; then
     log "✅ Digest for $LATEST_VERSION: $NEW_DIGEST"
