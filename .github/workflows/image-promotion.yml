@@ -94,6 +94,8 @@ jobs:
       - name: Fetch and pin image by digest
         id: fetch-digest
         run: |
+          ACCEPT_HEADER='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+
           # If 'latest' was entered, resolve the actual semantic version from Docker Hub
           REQUESTED="${{ env.N8N_VERSION }}"
           if [ "$REQUESTED" = "latest" ]; then
@@ -120,15 +122,17 @@ jobs:
 
           # Resolve the exact SHA256 digest for this version tag from Docker Hub
           TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:n8nio/n8n:pull" | jq -r '.token')
-          DIGEST=$(curl -s -H "Authorization: Bearer $TOKEN" \
-            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+          DIGEST=$(curl -fsSI -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: $ACCEPT_HEADER" \
             "https://registry-1.docker.io/v2/n8nio/n8n/manifests/$VERSION" \
-            --head | grep -i docker-content-digest | awk '{print $2}' | tr -d '\r')
+            | awk 'BEGIN { IGNORECASE = 1 } /^docker-content-digest:/ { gsub("\r", "", $2); print $2; exit }')
           if [ -z "$DIGEST" ]; then
             echo "ERROR: Could not resolve digest for n8nio/n8n:$VERSION. Is the version valid?"
             exit 1
           fi
           echo "Pinned version: $VERSION @ $DIGEST"
+          echo "Published platforms:"
+          docker buildx imagetools inspect "n8nio/n8n@$DIGEST" --raw | jq -r '.manifests[]?.platform | select(.os != null and .architecture != null and .os != "unknown" and .architecture != "unknown") | "- \(.os)/\(.architecture)"'
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
@@ -425,13 +429,10 @@ jobs:
       - name: Pull by digest and push to GHCR
         id: docker_push
         run: |
-          # Pull the exact pinned digest resolved during the scan step
           DIGEST="${{ needs.scan-images.outputs.image_digest }}"
-          docker pull n8nio/n8n@$DIGEST
           TRUSTED_IMAGE="ghcr.io/${{ github.repository }}/n8n-trusted:${{ needs.scan-images.outputs.resolved_version }}"
-          docker tag n8nio/n8n@$DIGEST $TRUSTED_IMAGE
-          PUSH_OUTPUT=$(docker push $TRUSTED_IMAGE)
-          GHCR_DIGEST=$(echo "$PUSH_OUTPUT" | grep -oP 'sha256:[a-f0-9]+')
+          docker buildx imagetools create --tag "$TRUSTED_IMAGE" "n8nio/n8n@$DIGEST"
+          GHCR_DIGEST=$(docker buildx imagetools inspect "$TRUSTED_IMAGE" | awk '/^Digest:/ { print $2; exit }')
           echo "GHCR digest: $GHCR_DIGEST"
           echo "digest=$GHCR_DIGEST" >> $GITHUB_OUTPUT
 
@@ -553,11 +554,9 @@ jobs:
         id: docker_push
         run: |
           DIGEST="${{ needs.scan-images.outputs.image_digest }}"
-          docker pull n8nio/n8n@$DIGEST
           TRUSTED_IMAGE="ghcr.io/${{ github.repository }}/n8n-trusted:${{ needs.scan-images.outputs.resolved_version }}"
-          docker tag n8nio/n8n@$DIGEST $TRUSTED_IMAGE
-          PUSH_OUTPUT=$(docker push $TRUSTED_IMAGE)
-          GHCR_DIGEST=$(echo "$PUSH_OUTPUT" | grep -oP 'sha256:[a-f0-9]+')
+          docker buildx imagetools create --tag "$TRUSTED_IMAGE" "n8nio/n8n@$DIGEST"
+          GHCR_DIGEST=$(docker buildx imagetools inspect "$TRUSTED_IMAGE" | awk '/^Digest:/ { print $2; exit }')
           echo "GHCR digest: $GHCR_DIGEST"
           echo "digest=$GHCR_DIGEST" >> $GITHUB_OUTPUT
 

@@ -5,7 +5,6 @@ services:
     # N8N_IMAGE_IDENTIFIER is auto-populated by install.sh (format: @sha256:... or :1.55.3)
     # Policy: promotion-policy.yml § image_pinning
     image: ghcr.io/${GITHUB_REPOSITORY_OWNER_LC}/${REPOSITORY_NAME}/n8n-trusted${N8N_IMAGE_IDENTIFIER}
-    platform: ${N8N_IMAGE_PLATFORM}
 
     # ── CIS Docker Benchmark v1.6.0 — Container Runtime Controls ─────────────
     # Reference: https://www.cisecurity.org/benchmark/docker
@@ -119,7 +118,6 @@ services:
 
   task-runners:
     image: n8nio/runners:${N8N_IMAGE_VERSION}
-    platform: ${N8N_IMAGE_PLATFORM}
     restart: "unless-stopped"
     depends_on:
       - n8n
