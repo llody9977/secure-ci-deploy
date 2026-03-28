@@ -79,11 +79,11 @@ To run image promotion manually:
 
 ## Key Paths
 
-- [image-promotion.yml](.github/workflows/image-promotion.yml)
-- [rescan.yml](.github/workflows/rescan.yml)
-- [docker-compose.yml](iac/n8n/docker-compose.yml)
-- [install.sh](iac/n8n/install.sh)
-- [upgrade.sh](iac/n8n/upgrade.sh)
+- [image-promotion.yml](https://github.com/llody9977/secure-ci-deploy/blob/main/.github/workflows/image-promotion.yml)
+- [rescan.yml](https://github.com/llody9977/secure-ci-deploy/blob/main/.github/workflows/rescan.yml)
+- [docker-compose.yml](https://github.com/llody9977/secure-ci-deploy/blob/main/iac/n8n/docker-compose.yml)
+- [install.sh](https://github.com/llody9977/secure-ci-deploy/blob/main/iac/n8n/install.sh)
+- [upgrade.sh](https://github.com/llody9977/secure-ci-deploy/blob/main/iac/n8n/upgrade.sh)
 
 ## References
 
