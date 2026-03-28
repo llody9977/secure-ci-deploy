@@ -146,11 +146,12 @@ RETRIES=5
 HEALTHY=false
 for i in $(seq 1 $RETRIES); do
     STATUS=$(docker compose ps --format json | jq -r '.[] | select(.Service=="n8n") | .Health' 2>/dev/null || echo "")
-    if [ "$STATUS" = "healthy" ]; then
+    RUNNERS_RUNNING=$(docker compose ps --format json | jq -r '.[] | select(.Service=="task-runners") | .State' 2>/dev/null || echo "")
+    if [ "$STATUS" = "healthy" ] && [ "$RUNNERS_RUNNING" = "running" ]; then
         HEALTHY=true
         break
     fi
-    log "   Health check attempt $i/$RETRIES: $STATUS"
+    log "   Health check attempt $i/$RETRIES: n8n=$STATUS task-runners=$RUNNERS_RUNNING"
     sleep 10
 done
 

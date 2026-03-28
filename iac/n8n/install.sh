@@ -55,6 +55,14 @@ normalize_memory_limit() {
     fi
 }
 
+generate_runner_auth_token() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 32
+    else
+        od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+    fi
+}
+
 REPO_SLUG="$(resolve_repo_slug)"
 if [ -z "$REPO_SLUG" ]; then
     TEMPLATE_OWNER="$(get_kv_value "$ENV_TEMPLATE" "GITHUB_REPOSITORY_OWNER_LC")"
@@ -218,6 +226,9 @@ PREV_IDENTIFIER=""
 N8N_HOST_PORT="$(get_kv_value "$ENV_FILE" "N8N_HOST_PORT")"
 N8N_CONTAINER_PORT="$(get_kv_value "$ENV_FILE" "N8N_CONTAINER_PORT")"
 N8N_IMAGE_PLATFORM="$(get_kv_value "$ENV_FILE" "N8N_IMAGE_PLATFORM")"
+N8N_RUNNERS_BROKER_PORT="$(get_kv_value "$ENV_FILE" "N8N_RUNNERS_BROKER_PORT")"
+N8N_RUNNERS_AUTO_SHUTDOWN_TIMEOUT="$(get_kv_value "$ENV_FILE" "N8N_RUNNERS_AUTO_SHUTDOWN_TIMEOUT")"
+N8N_RUNNERS_AUTH_TOKEN="$(get_kv_value "$ENV_FILE" "N8N_RUNNERS_AUTH_TOKEN")"
 
 if [ ! -f "$ENV_FILE" ]; then
     echo ""
@@ -232,6 +243,11 @@ fi
 N8N_HOST_PORT=${N8N_HOST_PORT:-5678}
 N8N_CONTAINER_PORT=${N8N_CONTAINER_PORT:-5678}
 N8N_IMAGE_PLATFORM=${N8N_IMAGE_PLATFORM:-linux/amd64}
+N8N_RUNNERS_BROKER_PORT=${N8N_RUNNERS_BROKER_PORT:-5679}
+N8N_RUNNERS_AUTO_SHUTDOWN_TIMEOUT=${N8N_RUNNERS_AUTO_SHUTDOWN_TIMEOUT:-15}
+if [ -z "$N8N_RUNNERS_AUTH_TOKEN" ] || [ "$N8N_RUNNERS_AUTH_TOKEN" = "<random_secure_token>" ]; then
+    N8N_RUNNERS_AUTH_TOKEN="$(generate_runner_auth_token)"
+fi
 
 SED_CMD="sed -i"
 [[ "$OSTYPE" == "darwin"* ]] && SED_CMD="sed -i ''"
@@ -242,6 +258,9 @@ $SED_CMD "s|^REPOSITORY_NAME=.*|REPOSITORY_NAME=$REPO_NAME|" "$ENV_FILE"
 $SED_CMD "s|^N8N_HOST_PORT=.*|N8N_HOST_PORT=$N8N_HOST_PORT|" "$ENV_FILE"
 $SED_CMD "s|^N8N_CONTAINER_PORT=.*|N8N_CONTAINER_PORT=$N8N_CONTAINER_PORT|" "$ENV_FILE"
 $SED_CMD "s|^N8N_IMAGE_PLATFORM=.*|N8N_IMAGE_PLATFORM=$N8N_IMAGE_PLATFORM|" "$ENV_FILE"
+$SED_CMD "s|^N8N_RUNNERS_BROKER_PORT=.*|N8N_RUNNERS_BROKER_PORT=$N8N_RUNNERS_BROKER_PORT|" "$ENV_FILE"
+$SED_CMD "s|^N8N_RUNNERS_AUTO_SHUTDOWN_TIMEOUT=.*|N8N_RUNNERS_AUTO_SHUTDOWN_TIMEOUT=$N8N_RUNNERS_AUTO_SHUTDOWN_TIMEOUT|" "$ENV_FILE"
+$SED_CMD "s|^N8N_RUNNERS_AUTH_TOKEN=.*|N8N_RUNNERS_AUTH_TOKEN=$N8N_RUNNERS_AUTH_TOKEN|" "$ENV_FILE"
 $SED_CMD "s|^N8N_IMAGE_VERSION=.*|N8N_IMAGE_VERSION=$N8N_VERSION|" "$ENV_FILE"
 $SED_CMD "s|^MEM_LIMIT=.*|MEM_LIMIT=$MEM_LIMIT|" "$ENV_FILE"
 $SED_CMD "s|^CPU_LIMIT=.*|CPU_LIMIT=$CPU_LIMIT|" "$ENV_FILE"
@@ -260,6 +279,7 @@ echo ""
 echo "🚀 Deploying n8n ${N8N_VERSION}..."
 echo "---------------------------------------------"
 echo "Requested image platform: ${N8N_IMAGE_PLATFORM}"
+echo "Task runners: external mode via broker port ${N8N_RUNNERS_BROKER_PORT}"
 
 docker compose up -d
 
@@ -267,7 +287,8 @@ echo "---------------------------------------------"
 echo "⏳ Waiting for n8n to start..."
 STARTED=false
 for _ in $(seq 1 18); do
-    if docker ps --filter label=com.docker.compose.service=n8n --filter status=running --format '{{.Names}}' | grep -q .; then
+    if docker ps --filter label=com.docker.compose.service=n8n --filter status=running --format '{{.Names}}' | grep -q . \
+        && docker ps --filter label=com.docker.compose.service=task-runners --filter status=running --format '{{.Names}}' | grep -q .; then
         STATUS_CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://${FINAL_IP}:${N8N_HOST_PORT}/healthz" || true)
         if [ "$STATUS_CODE" = "200" ] || [ "$STATUS_CODE" = "401" ] || [ "$STATUS_CODE" = "403" ]; then
             STARTED=true

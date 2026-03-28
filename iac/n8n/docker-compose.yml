@@ -90,9 +90,11 @@ services:
       - N8N_USER_MANAGEMENT_DISABLED=false
       - WEBHOOK_URL=http://${HOST_IP}:${N8N_HOST_PORT}/
       - N8N_SECURE_COOKIE=false
-      # Disable task runners entirely — prevents Python/JS runners from starting
-      # in internal mode. Python 3 is not installed in this hardened image.
-      - N8N_RUNNERS_ENABLED=false
+      - N8N_RUNNERS_MODE=external
+      - N8N_RUNNERS_BROKER_LISTEN_ADDRESS=0.0.0.0
+      - N8N_RUNNERS_BROKER_PORT=${N8N_RUNNERS_BROKER_PORT}
+      - N8N_RUNNERS_AUTH_TOKEN=${N8N_RUNNERS_AUTH_TOKEN}
+      - N8N_NATIVE_PYTHON_RUNNER=true
 
     # ── Health Check ──────────────────────────────────────────────────────────
     healthcheck:
@@ -109,6 +111,36 @@ services:
 
     # ── Logging ───────────────────────────────────────────────────────────────
     # Prevent unbounded log growth on the host
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  task-runners:
+    image: n8nio/runners:${N8N_IMAGE_VERSION}
+    platform: ${N8N_IMAGE_PLATFORM}
+    restart: "unless-stopped"
+    depends_on:
+      - n8n
+    security_opt:
+      - no-new-privileges:true
+      - apparmor:docker-default
+    cap_drop:
+      - ALL
+    read_only: true
+    pids_limit: ${PIDS_LIMIT:-200}
+    mem_limit: ${MEM_LIMIT:-1g}
+    memswap_limit: ${MEM_LIMIT:-1g}
+    cpus: "${CPU_LIMIT:-1.0}"
+    networks:
+      - n8n_net
+    tmpfs:
+      - /tmp:mode=1777,size=128m,nosuid
+    environment:
+      - N8N_RUNNERS_TASK_BROKER_URI=http://n8n:${N8N_RUNNERS_BROKER_PORT}
+      - N8N_RUNNERS_AUTH_TOKEN=${N8N_RUNNERS_AUTH_TOKEN}
+      - N8N_RUNNERS_AUTO_SHUTDOWN_TIMEOUT=${N8N_RUNNERS_AUTO_SHUTDOWN_TIMEOUT}
     logging:
       driver: "json-file"
       options:
