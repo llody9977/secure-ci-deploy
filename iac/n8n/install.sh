@@ -217,6 +217,7 @@ fi
 PREV_IDENTIFIER=""
 N8N_HOST_PORT="$(get_kv_value "$ENV_FILE" "N8N_HOST_PORT")"
 N8N_CONTAINER_PORT="$(get_kv_value "$ENV_FILE" "N8N_CONTAINER_PORT")"
+N8N_IMAGE_PLATFORM="$(get_kv_value "$ENV_FILE" "N8N_IMAGE_PLATFORM")"
 
 if [ ! -f "$ENV_FILE" ]; then
     echo ""
@@ -230,6 +231,7 @@ fi
 
 N8N_HOST_PORT=${N8N_HOST_PORT:-5678}
 N8N_CONTAINER_PORT=${N8N_CONTAINER_PORT:-5678}
+N8N_IMAGE_PLATFORM=${N8N_IMAGE_PLATFORM:-linux/amd64}
 
 SED_CMD="sed -i"
 [[ "$OSTYPE" == "darwin"* ]] && SED_CMD="sed -i ''"
@@ -239,6 +241,7 @@ $SED_CMD "s/^GITHUB_REPOSITORY_OWNER_LC=.*/GITHUB_REPOSITORY_OWNER_LC=$REPO_OWNE
 $SED_CMD "s/^REPOSITORY_NAME=.*/REPOSITORY_NAME=$REPO_NAME/" "$ENV_FILE"
 $SED_CMD "s/^N8N_HOST_PORT=.*/N8N_HOST_PORT=$N8N_HOST_PORT/" "$ENV_FILE"
 $SED_CMD "s/^N8N_CONTAINER_PORT=.*/N8N_CONTAINER_PORT=$N8N_CONTAINER_PORT/" "$ENV_FILE"
+$SED_CMD "s/^N8N_IMAGE_PLATFORM=.*/N8N_IMAGE_PLATFORM=$N8N_IMAGE_PLATFORM/" "$ENV_FILE"
 $SED_CMD "s/^N8N_IMAGE_VERSION=.*/N8N_IMAGE_VERSION=$N8N_VERSION/" "$ENV_FILE"
 $SED_CMD "s/^MEM_LIMIT=.*/MEM_LIMIT=$MEM_LIMIT/" "$ENV_FILE"
 $SED_CMD "s/^CPU_LIMIT=.*/CPU_LIMIT=$CPU_LIMIT/" "$ENV_FILE"
@@ -256,14 +259,25 @@ fi
 echo ""
 echo "🚀 Deploying n8n ${N8N_VERSION}..."
 echo "---------------------------------------------"
+echo "Requested image platform: ${N8N_IMAGE_PLATFORM}"
 
 docker compose up -d
 
 echo "---------------------------------------------"
 echo "⏳ Waiting for n8n to start..."
-sleep 5
+STARTED=false
+for _ in $(seq 1 18); do
+    if docker ps --filter label=com.docker.compose.service=n8n --filter status=running --format '{{.Names}}' | grep -q .; then
+        STATUS_CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://${FINAL_IP}:${N8N_HOST_PORT}/healthz" || true)
+        if [ "$STATUS_CODE" = "200" ] || [ "$STATUS_CODE" = "401" ] || [ "$STATUS_CODE" = "403" ]; then
+            STARTED=true
+            break
+        fi
+    fi
+    sleep 5
+done
 
-if docker ps | grep -q "n8n-trusted"; then
+if [ "$STARTED" = true ]; then
     echo ""
     echo "🎉 SUCCESS! n8n ${N8N_VERSION} deployed."
     echo "============================================="
