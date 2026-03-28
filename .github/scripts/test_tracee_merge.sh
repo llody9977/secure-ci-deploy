@@ -25,6 +25,12 @@ cat > "$tmpdir/trivy-report.raw.json" <<'EOF'
           "InstalledVersion": "3.0",
           "Severity": "MEDIUM",
           "PublishedDate": "2025-12-01T00:00:00Z"
+        },
+        {
+          "VulnerabilityID": "CVE-2024-3333",
+          "PkgName": "zlib",
+          "InstalledVersion": "1.3.1-r2",
+          "Severity": "HIGH"
         }
       ]
     }
@@ -35,6 +41,7 @@ EOF
 cat > "$tmpdir/package-files.tsv" <<'EOF'
 busybox	/bin/busybox
 openssl	/lib/libssl.so.3
+zlib	/lib/libz.so.1
 EOF
 
 cat > "$tmpdir/tracee-events.jsonl" <<'EOF'
@@ -47,6 +54,16 @@ cat > "$tmpdir/kev.json" <<'EOF'
 {"vulnerabilities":[]}
 EOF
 
+cat > "$tmpdir/epss.json" <<'EOF'
+{
+  "data": [
+    {"cve": "CVE-2024-1111", "epss": "0.001"},
+    {"cve": "CVE-2024-2222", "epss": "0.001"},
+    {"cve": "CVE-2024-3333", "epss": "0.001"}
+  ]
+}
+EOF
+
 python3 .github/scripts/merge_tracee_reachability.py \
   "$tmpdir/trivy-report.raw.json" \
   "$tmpdir/package-files.tsv" \
@@ -54,7 +71,7 @@ python3 .github/scripts/merge_tracee_reachability.py \
   "$tmpdir/target-container-id.txt" \
   "$tmpdir/trivy-report.tracee.json"
 
-python3 .github/scripts/enrich_findings.py \
+EPSS_DATA_FILE="$tmpdir/epss.json" python3 .github/scripts/enrich_findings.py \
   "$tmpdir/trivy-report.tracee.json" \
   "$tmpdir/kev.json" \
   "$tmpdir/trivy-report.enriched.json"
@@ -69,6 +86,8 @@ jq -e '.ReachabilitySummary.matched_event_count == 1' "$tmpdir/trivy-report.trac
 jq -e '.ReachabilitySummary.reachable_vulnerability_count == 1' "$tmpdir/trivy-report.tracee.json" > /dev/null
 jq -e '[.Results[]?.Vulnerabilities[]? | select(.VulnerabilityID == "CVE-2024-1111") | .Reachability] | any(. == "Yes")' "$tmpdir/trivy-report.enriched.json" > /dev/null
 jq -e '[.Results[]?.Vulnerabilities[]? | select(.VulnerabilityID == "CVE-2024-2222") | .Reachability] | any(. == "No")' "$tmpdir/trivy-report.enriched.json" > /dev/null
+jq -e '[.Results[]?.Vulnerabilities[]? | select(.VulnerabilityID == "CVE-2024-3333") | .GateDecision] | any(. == "AUTO_ALLOWED")' "$tmpdir/trivy-report.enriched.json" > /dev/null
+jq -e '.AnalysisSummary.unknown_age_critical_high_count == 0' "$tmpdir/trivy-report.enriched.json" > /dev/null
 grep -q "Reachability" "$summary_path"
 
 echo "Tracee merge fixture passed."

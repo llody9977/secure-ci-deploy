@@ -126,6 +126,7 @@ def main():
         epss_score = epss_scores.get(cve_id, 0.0)
         epss_label = epss_risk(epss_score)
         epss_percent = round(epss_score * 100, 2)
+        reachable = bool(vuln.get("Reachable"))
 
         gate_decision = "AUTO_ALLOWED"
         gate_reasons = []
@@ -134,9 +135,13 @@ def main():
             summary["critical_high_count"] += 1
 
             if age_days is None:
-                gate_decision = "MANUAL_REVIEW"
-                gate_reasons.append("age_unknown")
-                summary["unknown_age_critical_high_count"] += 1
+                # Unknown age is tolerated only for lower-risk findings that are not
+                # known exploited, have low predicted exploitation likelihood, and
+                # showed no runtime reachability signal in the smoke test.
+                if kev_hit or epss_label != "LOW" or reachable:
+                    gate_decision = "MANUAL_REVIEW"
+                    gate_reasons.append("age_unknown")
+                    summary["unknown_age_critical_high_count"] += 1
             elif age_days >= 30:
                 gate_decision = "MANUAL_REVIEW"
                 gate_reasons.append("age_30d_or_more")
