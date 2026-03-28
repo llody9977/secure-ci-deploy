@@ -18,6 +18,29 @@ get_env_value() {
     awk -F '=' -v search_key="$key" '$1 == search_key {print substr($0, index($0, "=") + 1); exit}' "$ENV_FILE"
 }
 
+get_docker_host_platform() {
+    local os arch
+
+    os="$(docker version --format '{{.Server.Os}}' 2>/dev/null || true)"
+    arch="$(docker version --format '{{.Server.Arch}}' 2>/dev/null || true)"
+
+    if [ -n "$os" ] && [ -n "$arch" ]; then
+        printf '%s/%s\n' "$os" "$arch"
+    else
+        printf '%s\n' "linux/amd64"
+    fi
+}
+
+pull_runner_image_for_host() {
+    local version="$1"
+    local host_platform="$2"
+    local runner_image="n8nio/runners:${version}"
+
+    log "Refreshing task runner image for host platform ${host_platform}"
+    docker image rm -f "$runner_image" >/dev/null 2>&1 || true
+    docker pull --platform "$host_platform" "$runner_image" >/dev/null
+}
+
 resolve_repo_slug() {
     local remote_url slug env_owner env_repo
 
@@ -135,6 +158,8 @@ else
 fi
 
 cd "$SCRIPT_DIR"
+HOST_PLATFORM="$(get_docker_host_platform)"
+pull_runner_image_for_host "$LATEST_VERSION" "$HOST_PLATFORM"
 docker compose pull 2>&1 | tee -a "$LOG_FILE"
 docker compose up -d 2>&1 | tee -a "$LOG_FILE"
 

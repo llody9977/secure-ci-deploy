@@ -63,6 +63,29 @@ generate_runner_auth_token() {
     fi
 }
 
+get_docker_host_platform() {
+    local os arch
+
+    os="$(docker version --format '{{.Server.Os}}' 2>/dev/null || true)"
+    arch="$(docker version --format '{{.Server.Arch}}' 2>/dev/null || true)"
+
+    if [ -n "$os" ] && [ -n "$arch" ]; then
+        printf '%s/%s\n' "$os" "$arch"
+    else
+        printf '%s\n' "linux/amd64"
+    fi
+}
+
+pull_runner_image_for_host() {
+    local version="$1"
+    local host_platform="$2"
+    local runner_image="n8nio/runners:${version}"
+
+    echo "Refreshing task runner image for host platform ${host_platform}..."
+    docker image rm -f "$runner_image" >/dev/null 2>&1 || true
+    docker pull --platform "$host_platform" "$runner_image" >/dev/null
+}
+
 REPO_SLUG="$(resolve_repo_slug)"
 if [ -z "$REPO_SLUG" ]; then
     TEMPLATE_OWNER="$(get_kv_value "$ENV_TEMPLATE" "GITHUB_REPOSITORY_OWNER_LC")"
@@ -277,6 +300,9 @@ echo "🚀 Deploying n8n ${N8N_VERSION}..."
 echo "---------------------------------------------"
 echo "Image platform: automatic host-native selection"
 echo "Task runners: external mode via broker port ${N8N_RUNNERS_BROKER_PORT}"
+
+HOST_PLATFORM="$(get_docker_host_platform)"
+pull_runner_image_for_host "$N8N_VERSION" "$HOST_PLATFORM"
 
 docker compose up -d
 
