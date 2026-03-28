@@ -1,0 +1,249 @@
+name: Continuous Re-Scan (Image Lifecycle)
+
+# Runs weekly to detect when the latest promoted image becomes ineligible under
+# the current age/KEV/EPSS promotion policy.
+on:
+  schedule:
+    - cron: '0 0 * * 1'   # Every Monday at 00:00 UTC
+  workflow_dispatch:        # Allow manual trigger for ad-hoc re-scanning
+
+jobs:
+  rescan:
+    name: Re-Scan Promoted Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      issues: write         # Needed to open alert issues
+      security-events: write
+    outputs:
+      scanned_versions: ${{ steps.rescan.outputs.scanned_versions }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release jq
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update && sudo apt-get install -y trivy
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download CISA KEV catalogue
+        run: |
+          curl -s -o kev.json https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json
+          echo "KEV catalogue downloaded: $(jq '.count' kev.json) entries"
+
+      - name: Fetch latest promoted release and re-scan
+        id: rescan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ALERT_BODY=""
+          ALERT_FOUND=false
+          mkdir -p sarifs
+          SCANNED_TAGS=""
+
+          # Resolve the latest promoted GitHub Release in this repo
+          LATEST_TAG=$(gh release list \
+            --repo ${{ github.repository }} \
+            --limit 20 \
+            --json tagName \
+            --jq '[.[].tagName | select(startswith("n8n-"))] | sort_by(sub("^n8n-"; "") | split(".") | map(tonumber)) | last // ""')
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No releases found."
+            echo "scanned_versions=[]" >> $GITHUB_OUTPUT
+            echo "alert_found=false" >> $GITHUB_OUTPUT
+            echo "alert_body<<EOF" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Write the master summary header
+          echo "## 🛡️ Weekly Re-Scan Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Latest promoted release in scope: \`$LATEST_TAG\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | CRITICAL | HIGH | MEDIUM | LOW/UNKNOWN | Manual Review | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |" >> $GITHUB_STEP_SUMMARY
+
+          # Extract version from tag like 'n8n-1.55.3' -> '1.55.3'
+          VERSION=$(echo "$LATEST_TAG" | sed 's/^n8n-//')
+          if [ -z "$VERSION" ]; then
+            echo "Latest release tag '$LATEST_TAG' is not a valid n8n tag."
+            echo "scanned_versions=[]" >> $GITHUB_OUTPUT
+            echo "alert_found=false" >> $GITHUB_OUTPUT
+            echo "alert_body<<EOF" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "--- Re-scanning latest promoted image n8n-trusted:$VERSION ---"
+
+          IMAGE="ghcr.io/${{ github.repository }}/n8n-trusted:$VERSION"
+          if ! docker pull "$IMAGE" > /dev/null 2>&1; then
+            echo "  ⚠️  Could not pull $IMAGE — skipping"
+            echo "| $VERSION | — | — | — | — | — | ⚠️ Skipped |" >> $GITHUB_STEP_SUMMARY
+            echo "scanned_versions=[]" >> $GITHUB_OUTPUT
+            echo "alert_found=false" >> $GITHUB_OUTPUT
+            echo "alert_body<<EOF" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Full image scan — same method as image-promotion for consistent results
+          trivy image \
+            --format json \
+            --output "rescan-$VERSION.raw.json" \
+            --severity CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN \
+            "$IMAGE" || true
+
+          trivy image \
+            --format sarif \
+            --output "sarifs/rescan-$VERSION.sarif" \
+            --severity CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN \
+            "$IMAGE" || true
+
+          # Record this version was successfully scanned
+          SCANNED_TAGS="$VERSION"
+
+          chmod +x .github/scripts/collect_package_files.sh .github/scripts/run_tracee_reachability.sh
+          mkdir -p "tracee-$VERSION"
+          .github/scripts/collect_package_files.sh "$IMAGE" "rescan-$VERSION.raw.json" "tracee-$VERSION/package-files.tsv"
+          .github/scripts/run_tracee_reachability.sh "$IMAGE" "$PWD/tracee-$VERSION" "tracee-rescan-$VERSION-${{ github.run_id }}" 15679
+          python3 .github/scripts/merge_tracee_reachability.py \
+            "rescan-$VERSION.raw.json" \
+            "tracee-$VERSION/package-files.tsv" \
+            "tracee-$VERSION/tracee-events.jsonl" \
+            "$(cat "tracee-$VERSION/target-container-id.txt")" \
+            "rescan-$VERSION.tracee.json"
+          python3 .github/scripts/enrich_findings.py "rescan-$VERSION.tracee.json" kev.json "rescan-$VERSION.json"
+
+          # Count findings by severity
+          CRIT_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "rescan-$VERSION.json" 2>/dev/null || echo 0)
+          HIGH_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "rescan-$VERSION.json" 2>/dev/null || echo 0)
+          MED_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "rescan-$VERSION.json" 2>/dev/null || echo 0)
+          LOW_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW" or .Severity=="UNKNOWN")] | length' "rescan-$VERSION.json" 2>/dev/null || echo 0)
+          MANUAL_REVIEW_COUNT=$(jq -r '.AnalysisSummary.manual_review_count // 0' "rescan-$VERSION.json")
+          AUTO_ELIGIBLE_COUNT=$(jq -r '.AnalysisSummary.auto_allowed_critical_high_count // 0' "rescan-$VERSION.json")
+          AGE_REVIEW_COUNT=$(jq -r '.AnalysisSummary.older_than_30_days_count // 0' "rescan-$VERSION.json")
+          KEV_REVIEW_COUNT=$(jq -r '.AnalysisSummary.kev_critical_high_count // 0' "rescan-$VERSION.json")
+          EPSS_REVIEW_COUNT=$(jq -r '.AnalysisSummary.epss_high_or_critical_count // 0' "rescan-$VERSION.json")
+          UNKNOWN_AGE_REVIEW_COUNT=$(jq -r '.AnalysisSummary.unknown_age_critical_high_count // 0' "rescan-$VERSION.json")
+
+          # Overview table row
+          if [ "$MANUAL_REVIEW_COUNT" -gt 0 ]; then
+            STATUS="🟠 Manual Review"
+          elif [ "$AUTO_ELIGIBLE_COUNT" -gt 0 ]; then
+            STATUS="✅ Auto Eligible"
+          else
+            STATUS="✅ Clean"
+          fi
+          echo "| $VERSION | $CRIT_COUNT | $HIGH_COUNT | $MED_COUNT | $LOW_COUNT | $MANUAL_REVIEW_COUNT | $STATUS |" >> $GITHUB_STEP_SUMMARY
+
+          # Per-version detailed vulnerability section
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          python3 .github/scripts/generate_summary.py "rescan-$VERSION.json" kev.json "$VERSION" || true
+
+          # Escalate if alert condition triggers
+          if [ "$MANUAL_REVIEW_COUNT" -gt 0 ]; then
+            ALERT_FOUND=true
+            ALERT_BODY="$ALERT_BODY\n\n### \`n8n-trusted:$VERSION\`\n"
+            ALERT_BODY="$ALERT_BODY- 🟠 **$MANUAL_REVIEW_COUNT finding(s)** now require manual review under the promotion gate\n"
+            [ "$AGE_REVIEW_COUNT" -gt 0 ] && ALERT_BODY="$ALERT_BODY- ⏱️ **$AGE_REVIEW_COUNT** critical/high CVE(s) are now at least 30 days old\n"
+            [ "$KEV_REVIEW_COUNT" -gt 0 ] && ALERT_BODY="$ALERT_BODY- 🚨 **$KEV_REVIEW_COUNT** critical/high CVE(s) now match KEV\n"
+            [ "$EPSS_REVIEW_COUNT" -gt 0 ] && ALERT_BODY="$ALERT_BODY- 📈 **$EPSS_REVIEW_COUNT** critical/high CVE(s) are now EPSS HIGH/CRITICAL\n"
+            [ "$UNKNOWN_AGE_REVIEW_COUNT" -gt 0 ] && ALERT_BODY="$ALERT_BODY- ❓ **$UNKNOWN_AGE_REVIEW_COUNT** critical/high CVE(s) have unknown published dates\n"
+            echo "  ⚠️  Alert triggered for $VERSION"
+          else
+            echo "  ✅ $VERSION remains auto-eligible"
+          fi
+
+          # Build JSON array of successfully scanned versions
+          SCANNED_VERSIONS_JSON=$(echo "$SCANNED_TAGS" | tr ' ' '\n' | grep -v '^$' | jq -R . | jq -s -c .)
+          echo "scanned_versions=$SCANNED_VERSIONS_JSON" >> $GITHUB_OUTPUT
+
+          echo "alert_found=$ALERT_FOUND" >> $GITHUB_OUTPUT
+          echo "alert_body<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$ALERT_BODY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Open GitHub Issue if new findings detected
+        if: steps.rescan.outputs.alert_found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALERT_BODY: ${{ steps.rescan.outputs.alert_body }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          cat << EOF > issue_body.md
+          ## Weekly Re-Scan Alert
+
+          One or more previously promoted images are now **ineligible under the current age/KEV/EPSS promotion gate**.
+
+          **Action required**: Review the findings below and decide whether to:
+          1. Promote a newer clean version via the Image Promotion pipeline
+          2. Revoke the affected image from deployment (update \`N8N_IMAGE_DIGEST\` on hosts)
+
+          $ALERT_BODY
+
+          ---
+          👉 [View Full Vulnerability Details (Workflow Run)]($RUN_URL)
+
+          *Triggered by the weekly re-scan job on $(date -u '+%Y-%m-%d')*
+          EOF
+
+          gh label create security --color "FF0000" --force || true
+
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "🚨 Re-Scan Alert: promoted image(s) now require manual review" \
+            --body-file issue_body.md \
+            --label "security"
+
+      - name: Upload SARIFs as internal artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: sarif-files
+          path: sarifs/
+          if-no-files-found: ignore
+
+  upload-sarifs:
+    name: Upload SARIFs to Code Scanning
+    needs: rescan
+    if: always() && needs.rescan.outputs.scanned_versions != '[]' && needs.rescan.outputs.scanned_versions != ''
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJson(needs.rescan.outputs.scanned_versions) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Download SARIF artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sarif-files
+          path: sarifs/
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        if: hashFiles(format('sarifs/rescan-{0}.sarif', matrix.version)) != ''
+        uses: github/codeql-action/upload-sarif@b1bff81932f5cdfc8695c7752dcee935dcd061c8 # v4
+        with:
+          sarif_file: "sarifs/rescan-${{ matrix.version }}.sarif"
+          category: "rescan-${{ matrix.version }}"

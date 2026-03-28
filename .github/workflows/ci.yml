@@ -1,0 +1,394 @@
+name: CI Scan
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  config-scan:
+    name: IaC Misconfiguration & Secret Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: ShellCheck Scripts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck > /dev/null
+          echo "Running ShellCheck on bash scripts..."
+          shellcheck iac/n8n/install.sh iac/n8n/upgrade.sh .github/scripts/*.sh
+
+      - name: IaC Scan (Checkov)
+        uses: bridgecrewio/checkov-action@2fd3901c8feb52417f27f0d9800259a106c1ec1e # master
+        with:
+          directory: iac/n8n
+          quiet: true
+          soft_fail: true
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update && sudo apt-get install -y trivy jq
+
+      - name: Scan repo — IaC misconfigurations and secrets
+        id: trivy-scan
+        run: |
+          # Generate JSON report for artifact (always saved, even on failure)
+          trivy fs . \
+            --scanners misconfig,secret \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --format json \
+            --output trivy-iac-report.json \
+            --exit-code 0   # don't exit here — gate below handles it
+
+          # Generate human-readable table for the Job Summary
+          trivy fs . \
+            --scanners misconfig,secret \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --format table \
+            --output trivy-iac-summary.txt \
+            --exit-code 0
+
+          # Write to GitHub Actions Job Summary (visible on the PR checks page)
+          echo "## 🔍 IaC Misconfiguration & Secret Scan" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Scope:** \`CRITICAL\`, \`HIGH\` — unfixed only" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          cat trivy-iac-summary.txt >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+          # Count findings for gate decision
+          FINDINGS=$(jq '[.Results[]?.Misconfigurations//[], .Results[]?.Secrets//[]] | flatten | length' trivy-iac-report.json 2>/dev/null || echo 0)
+          echo "findings=$FINDINGS" >> $GITHUB_OUTPUT
+
+          if [ "$FINDINGS" -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **$FINDINGS finding(s) detected — download \`trivy-iac-report\` artifact for full details.**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **No CRITICAL/HIGH findings detected.**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload IaC Scan Report (always available, even on failure)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: trivy-iac-report
+          path: |
+            trivy-iac-report.json
+            trivy-iac-summary.txt
+
+      - name: Gate — block merge if findings detected
+        if: steps.trivy-scan.outputs.findings != '0'
+        run: |
+          echo "❌ Trivy found CRITICAL/HIGH misconfigurations or secrets."
+          echo "   Download the 'trivy-iac-report' artifact from this run for details."
+          echo "   Fix all findings in the source files and push again."
+          exit 1
+
+  tracee-reachability-test:
+    name: Tracee Reachability Integration Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Trivy and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release jq curl
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update && sudo apt-get install -y trivy
+
+      - name: Prepare Tracee helper scripts
+        run: |
+          chmod +x .github/scripts/collect_package_files.sh .github/scripts/run_tracee_reachability.sh .github/scripts/test_tracee_merge.sh
+
+      - name: Verify Tracee merge fixture
+        run: |
+          .github/scripts/test_tracee_merge.sh
+
+      - name: Pull test image
+        run: |
+          docker pull n8nio/n8n:latest
+
+      - name: Run Trivy image scan
+        run: |
+          trivy image \
+            --format json \
+            --output trivy-report.raw.json \
+            --severity CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN \
+            n8nio/n8n:latest
+
+      - name: Collect vulnerable package file map
+        run: |
+          .github/scripts/collect_package_files.sh n8nio/n8n:latest trivy-report.raw.json package-files.tsv
+
+      - name: Run Tracee smoke trace
+        run: |
+          .github/scripts/run_tracee_reachability.sh n8nio/n8n:latest "$PWD/tracee-output" tracee-ci-smoke 15678
+
+      - name: Merge Tracee reachability into scan report
+        run: |
+          python3 .github/scripts/merge_tracee_reachability.py \
+            trivy-report.raw.json \
+            package-files.tsv \
+            tracee-output/tracee-events.jsonl \
+            "$(cat tracee-output/target-container-id.txt)" \
+            trivy-report.tracee.json
+
+      - name: Enrich report with KEV and EPSS
+        run: |
+          curl -s -o kev.json https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json
+          python3 .github/scripts/enrich_findings.py trivy-report.tracee.json kev.json trivy-report.enriched.json
+
+      - name: Verify summary and reachability fields
+        run: |
+          python3 .github/scripts/generate_summary.py trivy-report.enriched.json kev.json ci-tracee-test
+
+          jq -e '.ReachabilitySummary.matched_event_count > 0' trivy-report.tracee.json > /dev/null
+          jq -e '[.Results[]?.Vulnerabilities[]? | has("Reachable")] | all' trivy-report.enriched.json > /dev/null
+          jq -e '[.Results[]?.Vulnerabilities[]? | .Reachability] | any(. == "Yes" or . == "No")' trivy-report.enriched.json > /dev/null
+          grep -q "Reachability" "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Tracee integration artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tracee-reachability-integration
+          path: |
+            trivy-report.raw.json
+            trivy-report.tracee.json
+            trivy-report.enriched.json
+            package-files.tsv
+            kev.json
+            tracee-output/
+
+  cis-compliance-check:
+    name: CIS Docker Benchmark v1.6.0 Compliance Check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install yq (YAML parser)
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Check CIS Docker Benchmark v1.6.0 compliance
+        id: cis-check
+        run: |
+          COMPOSE="iac/n8n/docker-compose.yml"
+          POLICY="policy/runtime-hardening-policy.yml"
+          FAIL=false
+          REPORT=""
+
+          echo "==================================================="
+          echo " CIS Docker Benchmark v1.6.0 — Compliance Check"
+          echo " Policy file: $POLICY"
+          echo " Compose file: $COMPOSE"
+          echo "==================================================="
+
+          add_result() {
+            local id="$1" status="$2" msg="$3"
+            if [ "$status" = "PASS" ]; then
+              echo "  ✅ CIS $id — $msg"
+            else
+              echo "  ❌ CIS $id — $msg"
+              FAIL=true
+            fi
+            REPORT="${REPORT}\n${status}: CIS ${id} — ${msg}"
+          }
+
+          # CIS 5.1 — AppArmor profile
+          if grep -q "apparmor:docker-default" "$COMPOSE"; then
+            add_result "5.1" "PASS" "AppArmor profile applied (apparmor:docker-default)"
+          else
+            add_result "5.1" "FAIL" "AppArmor profile missing from security_opt"
+          fi
+
+          # CIS 5.2 — cap_drop: ALL
+          if grep -q "cap_drop" "$COMPOSE" && grep -A2 "cap_drop" "$COMPOSE" | grep -q "ALL"; then
+            add_result "5.2" "PASS" "All capabilities dropped (cap_drop: ALL)"
+          else
+            add_result "5.2" "FAIL" "cap_drop: ALL is missing — capabilities are not restricted"
+          fi
+
+          # CIS 5.3 — No privileged mode
+          if ! grep -q "privileged: true" "$COMPOSE"; then
+            add_result "5.3" "PASS" "Privileged mode not set"
+          else
+            add_result "5.3" "FAIL" "privileged: true is set — remove immediately"
+          fi
+
+          # CIS 5.4 / 5.31 — No sensitive mounts or docker.sock
+          # Strip comment lines first to avoid matching documentation text in comments
+          if grep -q "volumes:" "$COMPOSE"; then
+            SENSITIVE_MOUNTS=$(grep -v '^\s*#' "$COMPOSE" | grep -E "(docker\.sock|/etc:|/proc:|/sys:|/dev:)" || true)
+            if [ -z "$SENSITIVE_MOUNTS" ]; then
+              add_result "5.4/5.31" "PASS" "No sensitive host paths or docker.sock mounted"
+            else
+              add_result "5.4/5.31" "FAIL" "Sensitive mount detected: $SENSITIVE_MOUNTS"
+            fi
+          else
+            add_result "5.4/5.31" "PASS" "No volumes defined"
+          fi
+
+          # CIS 5.7 — No privileged ports (< 1024)
+          PRIV_PORT=$(grep -oP ':\d+:' "$COMPOSE" | grep -oP '\d+' | awk '$1 < 1024' || true)
+          if [ -z "$PRIV_PORT" ]; then
+            add_result "5.7" "PASS" "No privileged ports mapped (ports < 1024)"
+          else
+            add_result "5.7" "FAIL" "Privileged port mapped: $PRIV_PORT"
+          fi
+
+          # CIS 5.10 — mem_limit set
+          if grep -q "mem_limit" "$COMPOSE"; then
+            add_result "5.10" "PASS" "Memory limit is set"
+          else
+            add_result "5.10" "FAIL" "mem_limit is not set — container can exhaust host memory"
+          fi
+
+          # CIS 5.11 — cpus set
+          if grep -q "cpus" "$COMPOSE"; then
+            add_result "5.11" "PASS" "CPU limit is set"
+          else
+            add_result "5.11" "FAIL" "cpus is not set — container can monopolise host CPU"
+          fi
+
+          # CIS 5.12 — read_only root FS
+          if grep -q "read_only: true" "$COMPOSE"; then
+            add_result "5.12" "PASS" "Root filesystem is read-only"
+          else
+            add_result "5.12" "FAIL" "read_only: true is missing — root filesystem is writable"
+          fi
+
+          # CIS 5.13 — Not binding to 0.0.0.0
+          if grep -E "ports:" "$COMPOSE" | grep -qE '"0\.0\.0\.0:|^- 0\.0\.0\.0:'; then
+            add_result "5.13" "FAIL" "Port is bound to 0.0.0.0 — should bind to specific interface"
+          else
+            add_result "5.13" "PASS" "Port binding is interface-scoped (not 0.0.0.0)"
+          fi
+
+          # CIS 5.14 — Restart policy is on-failure:N
+          if grep -q "on-failure" "$COMPOSE"; then
+            add_result "5.14" "PASS" "Restart policy is on-failure (not always)"
+          else
+            add_result "5.14" "FAIL" "Restart policy should be on-failure:N, not 'always' or 'unless-stopped'"
+          fi
+
+          # CIS 5.18 — ulimits set
+          if grep -q "ulimits" "$COMPOSE"; then
+            add_result "5.18" "PASS" "ulimits are configured"
+          else
+            add_result "5.18" "FAIL" "ulimits not set — file descriptor limits are unconstrained"
+          fi
+
+          # CIS 5.21 — Default seccomp not disabled
+          # Strip comment lines to avoid matching documentation text in comments
+          if grep -v '^\s*#' "$COMPOSE" | grep -q "seccomp:unconfined"; then
+            add_result "5.21" "FAIL" "seccomp:unconfined is set — default seccomp profile is disabled"
+          else
+            add_result "5.21" "PASS" "Default seccomp profile is active (not disabled)"
+          fi
+
+          # CIS 5.25 — no-new-privileges
+          if grep -q "no-new-privileges:true" "$COMPOSE"; then
+            add_result "5.25" "PASS" "no-new-privileges is set"
+          else
+            add_result "5.25" "FAIL" "no-new-privileges:true is missing from security_opt"
+          fi
+
+          # CIS 5.28 — pids_limit set
+          if grep -q "pids_limit" "$COMPOSE"; then
+            add_result "5.28" "PASS" "PIDs cgroup limit (pids_limit) is set"
+          else
+            add_result "5.28" "FAIL" "pids_limit is not set — fork bombs are unconstrained"
+          fi
+
+          # CIS 5.29 — Custom network (not implicit default)
+          if grep -q "networks:" "$COMPOSE" && ! grep -q "network_mode: host" "$COMPOSE"; then
+            add_result "5.29" "PASS" "Custom network defined (not docker0 default bridge)"
+          else
+            add_result "5.29" "FAIL" "No custom network defined — container may be on the default docker0 bridge"
+          fi
+
+          echo ""
+          echo "==================================================="
+          if [ "$FAIL" = true ]; then
+            echo "❌ CIS COMPLIANCE CHECK FAILED — see violations above"
+            echo "   Fix the docker-compose.yml issues and push again."
+            echo "   Policy reference: $POLICY"
+          else
+            echo "✅ All automated CIS Docker Benchmark v1.6.0 checks PASSED"
+          fi
+          echo "==================================================="
+
+          # Write structured report file for artifact upload
+          echo "CIS Docker Benchmark v1.6.0 Compliance Report" > cis-compliance-report.txt
+          echo "Target: $COMPOSE" >> cis-compliance-report.txt
+          echo "Policy: $POLICY" >> cis-compliance-report.txt
+          echo "Date: $(date -u)" >> cis-compliance-report.txt
+          echo "" >> cis-compliance-report.txt
+          echo -e "$REPORT" >> cis-compliance-report.txt
+
+          # Write to GitHub Actions Job Summary (visible on the PR checks page)
+          echo "## 🛡️ CIS Docker Benchmark v1.6.0 Compliance" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Target:** \`$COMPOSE\`  **Policy:** \`$POLICY\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Result | Control | Detail |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          while IFS= read -r line; do
+            if echo "$line" | grep -q "^PASS:"; then
+              DETAIL="${line#PASS: }"
+              echo "| ✅ PASS | $DETAIL |" >> $GITHUB_STEP_SUMMARY
+            elif echo "$line" | grep -q "^FAIL:"; then
+              DETAIL="${line#FAIL: }"
+              echo "| ❌ **FAIL** | **$DETAIL** |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done < cis-compliance-report.txt
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "cis_pass=$([ "$FAIL" = false ] && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "cis_fail=$FAIL" >> $GITHUB_OUTPUT
+
+          if [ "$FAIL" = true ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **Compliance check FAILED — download the \`cis-compliance-report\` artifact for the full list of violations to fix.**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ **All checks passed.**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload CIS Compliance Report (always available, even on failure)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cis-compliance-report
+          path: cis-compliance-report.txt
+
+      - name: Gate — block merge if CIS violations detected
+        if: steps.cis-check.outputs.cis_fail == 'true'
+        run: |
+          echo "❌ CIS Docker Benchmark v1.6.0 compliance check FAILED."
+          echo "   Download the 'cis-compliance-report' artifact from this run."
+          echo "   Fix all ❌ FAIL items in iac/n8n/docker-compose.yml and push again."
+          echo "   Reference: policy/cis-docker-hardening.md"
+          exit 1

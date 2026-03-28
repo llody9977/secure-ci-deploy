@@ -1,0 +1,84 @@
+name: Weekly Upstream Version Check
+
+on:
+  schedule:
+    - cron: '0 2 * * 1' # Every Monday at 02:00 UTC
+  workflow_dispatch:
+
+jobs:
+  check-and-dispatch:
+    name: Check for New Upstream n8n Release
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Install jq
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq
+
+      - name: Check latest upstream version against latest promoted version
+        id: version-check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          TOKEN=$(curl -fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:n8nio/n8n:pull" | jq -r '.token')
+          LATEST_UPSTREAM=$(curl -fsSL -H "Authorization: Bearer $TOKEN" \
+            "https://registry-1.docker.io/v2/n8nio/n8n/tags/list" |
+            jq -r '.tags[]' |
+            grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' |
+            sort -V |
+            tail -1)
+
+          if [ -z "$LATEST_UPSTREAM" ]; then
+            echo "Unable to resolve the latest upstream n8n version."
+            exit 1
+          fi
+
+          LATEST_PROMOTED=$(gh release list \
+            --repo "${{ github.repository }}" \
+            --limit 100 \
+            --json tagName \
+            --jq '[.[].tagName | select(startswith("n8n-")) | sub("^n8n-"; "")] | sort_by(split(".") | map(tonumber)) | last // ""')
+
+          if [ -z "$LATEST_PROMOTED" ] || [ "$LATEST_PROMOTED" = "null" ]; then
+            echo "No promoted release found. Promotion should run for $LATEST_UPSTREAM."
+            echo "should_dispatch=true" >> "$GITHUB_OUTPUT"
+            echo "target_version=$LATEST_UPSTREAM" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          NEWEST=$(printf '%s\n%s\n' "$LATEST_PROMOTED" "$LATEST_UPSTREAM" | sort -V | tail -1)
+
+          if [ "$NEWEST" = "$LATEST_UPSTREAM" ] && [ "$LATEST_UPSTREAM" != "$LATEST_PROMOTED" ]; then
+            echo "New upstream version detected: $LATEST_UPSTREAM (latest promoted: $LATEST_PROMOTED)"
+            echo "should_dispatch=true" >> "$GITHUB_OUTPUT"
+            echo "target_version=$LATEST_UPSTREAM" >> "$GITHUB_OUTPUT"
+          else
+            echo "No new upstream version. Latest upstream: $LATEST_UPSTREAM, latest promoted: $LATEST_PROMOTED"
+            echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
+            echo "target_version=$LATEST_UPSTREAM" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger image promotion
+        if: steps.version-check.outputs.should_dispatch == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run image-promotion.yml \
+            --repo "${{ github.repository }}" \
+            -f n8n_version="${{ steps.version-check.outputs.target_version }}"
+
+      - name: Publish summary
+        run: |
+          echo "## Weekly Upstream Version Check" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Latest upstream version: \`${{ steps.version-check.outputs.target_version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.version-check.outputs.should_dispatch }}" = "true" ]; then
+            echo "- Result: triggered \`image-promotion.yml\` for a newer upstream release." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- Result: no newer upstream release was found, so promotion was not triggered." >> "$GITHUB_STEP_SUMMARY"
+          fi

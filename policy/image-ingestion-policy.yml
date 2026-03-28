@@ -1,0 +1,38 @@
+# Image Ingestion Policy
+# Controls what upstream images may enter this pipeline.
+# Changes require a Pull Request for auditability.
+#
+# Read by: .github/workflows/image-promotion.yml (Enforce Source Allowlist step)
+
+# ─── ALLOWLIST ───────────────────────────────────────────────────────────────
+# Only images from this exact upstream source are permitted.
+# Any other source MUST be explicitly added here via PR.
+allowlist:
+  source_image: "n8nio/n8n"
+
+  # Tags must be strict semver (x.y.z).
+  # Moving targets (latest, stable, nightly) are resolved to a semver first —
+  # they are never used directly as the ingestion reference.
+  tag_pattern: "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+
+# ─── VENDOR SIGNATURE POLICY ─────────────────────────────────────────────────
+# Defines how the pipeline handles upstream Sigstore/cosign signatures.
+# Options: required | warn | skip
+#
+#   required  — Pipeline fails if no valid vendor signature is found
+#   warn      — Logs a structured vendor risk gap; does not block ingestion
+#   skip      — No check performed (not recommended)
+vendor_signature:
+  mode: "warn"
+
+  # Document the accepted risk when mode is 'warn'.
+  # This is visible in every scan report artifact for audit purposes.
+  accepted_risk: |
+    n8n (n8nio/n8n) does not currently publish Sigstore or Notary v2 signatures.
+    Publisher identity is enforced by compensating controls:
+      - Source allowlisted to n8nio/n8n only (this file, PRs required)
+      - Strict semver tag enforcement (no moving targets)
+      - Immutable SHA256 digest pinning throughout the pipeline
+    This gap is logged in vendor-sig-check.txt in every scan report artifact.
+    Accepted by: platform security team
+    Review by: 2025-Q4

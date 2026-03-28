@@ -1,0 +1,623 @@
+name: Image Promotion (Trusted Source)
+
+on:
+  workflow_dispatch:
+    inputs:
+      n8n_version:
+        description: 'n8n version to pull (e.g. 1.55.3) — enter "latest" to auto-resolve'
+        required: false
+        default: 'latest'
+
+env:
+  N8N_VERSION: ${{ github.event.inputs.n8n_version || 'latest' }}
+
+jobs:
+  scan-images:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    outputs:
+      is_vulnerable: ${{ steps.trivy-scan.outputs.is_vulnerable }}
+      image_digest: ${{ steps.fetch-digest.outputs.digest }}
+      resolved_version: ${{ steps.fetch-digest.outputs.version }}
+      skip_promotion: ${{ steps.fetch-digest.outputs.skip_promotion }}
+      version_branch: ${{ steps.fetch-digest.outputs.version_branch }}
+      version_branch_sha: ${{ steps.fetch-digest.outputs.version_branch_sha }}
+    permissions:
+      contents: write
+      issues: write
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Trivy and cosign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release jq
+          # Install Trivy
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update && sudo apt-get install -y trivy
+          # Install cosign for upstream publisher identity checks
+          curl -sLO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+          sudo install -m 755 cosign-linux-amd64 /usr/local/bin/cosign
+
+      - name: Enforce Source Allowlist (Policy-as-Code)
+        run: |
+          ALLOWED_IMAGE=$(grep 'source_image:' policy/image-ingestion-policy.yml | awk '{print $2}' | tr -d '"')
+          TAG_PATTERN=$(grep 'tag_pattern:' policy/image-ingestion-policy.yml | awk '{print $2}' | tr -d '"')
+          REQUESTED_VERSION="${{ env.N8N_VERSION }}"
+
+          echo "Policy: allowed source = $ALLOWED_IMAGE"
+
+          # Enforce source repo allowlist
+          if [ "$ALLOWED_IMAGE" != "n8nio/n8n" ]; then
+            echo "❌ POLICY VIOLATION: Source image '$ALLOWED_IMAGE' is not the allowlisted source."
+            exit 1
+          fi
+          echo "✅ Source allowlist passed: n8nio/n8n"
+
+          # Enforce tag pattern (skip if 'latest' — will be resolved to semver in next step)
+          if [ "$REQUESTED_VERSION" != "latest" ]; then
+            if ! echo "$REQUESTED_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "❌ POLICY VIOLATION: Tag '$REQUESTED_VERSION' does not match semver pattern. Moving targets (stable, nightly, etc.) are not permitted."
+              exit 1
+            fi
+            echo "✅ Tag pattern passed: $REQUESTED_VERSION matches x.y.z"
+          fi
+
+      - name: Check Upstream Vendor Signature (Cosign)
+        run: |
+          echo "" >> trivy-summary-meta.txt || true
+          echo "### Upstream Vendor Signature Check" > vendor-sig-check.txt
+          echo "Checking if n8nio/n8n publishes Sigstore/cosign signatures..." >> vendor-sig-check.txt
+
+          # Strictly validating n8n publisher OIDC issuer and identity to prevent impersonation
+          if cosign verify n8nio/n8n:${{ env.N8N_VERSION }} \
+              --certificate-identity="https://github.com/n8nio/n8n/.github/workflows/release.yml@refs/heads/master" \
+              --certificate-oidc-issuer="https://token.actions.githubusercontent.com" 2>/dev/null; then
+            echo "✅ Vendor signature VERIFIED — n8n publishes strictly-scoped Sigstore signatures." >> vendor-sig-check.txt
+          else
+            echo "⚠️  VENDOR RISK GAP: n8nio/n8n does not publish Sigstore/cosign signatures." >> vendor-sig-check.txt
+            echo "   Publisher identity cannot be cryptographically verified upstream." >> vendor-sig-check.txt
+            echo "   Mitigations in place (per policy/image-ingestion-policy.yml):" >> vendor-sig-check.txt
+            echo "   - Source allowlisted to n8nio/n8n only" >> vendor-sig-check.txt
+            echo "   - Strict semver tag enforcement (no moving targets)" >> vendor-sig-check.txt
+            echo "   - Immutable SHA256 digest pinning throughout pipeline" >> vendor-sig-check.txt
+            echo "   Accepted risk: see policy/image-ingestion-policy.yml vendor_signature.accepted_risk" >> vendor-sig-check.txt
+          fi
+          cat vendor-sig-check.txt
+
+      - name: Fetch and pin image by digest
+        id: fetch-digest
+        run: |
+          # If 'latest' was entered, resolve the actual semantic version from Docker Hub
+          REQUESTED="${{ env.N8N_VERSION }}"
+          if [ "$REQUESTED" = "latest" ]; then
+            TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:n8nio/n8n:pull" | jq -r '.token')
+            RESOLVED=$(curl -s -H "Authorization: Bearer $TOKEN" \
+              "https://registry-1.docker.io/v2/n8nio/n8n/tags/list" | jq -r '.tags[]' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+            echo "Resolved latest -> $RESOLVED"
+            echo "N8N_VERSION=$RESOLVED" >> $GITHUB_ENV
+            VERSION=$RESOLVED
+          else
+            VERSION="$REQUESTED"
+          fi
+
+          # Check if this version has already been promoted to our GHCR (Idempotency Check)
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "https://ghcr.io/v2/${{ github.repository }}/n8n-trusted/manifests/$VERSION")
+          if [ "$STATUS" = "200" ]; then
+            echo "✅ Version $VERSION is already promoted in ghcr.io/${{ github.repository }}/n8n-trusted."
+            echo "No action required. Exiting gracefully."
+            echo "skip_promotion=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "skip_promotion=false" >> $GITHUB_OUTPUT
+
+          # Resolve the exact SHA256 digest for this version tag from Docker Hub
+          TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:n8nio/n8n:pull" | jq -r '.token')
+          DIGEST=$(curl -s -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+            "https://registry-1.docker.io/v2/n8nio/n8n/manifests/$VERSION" \
+            --head | grep -i docker-content-digest | awk '{print $2}' | tr -d '\r')
+          if [ -z "$DIGEST" ]; then
+            echo "ERROR: Could not resolve digest for n8nio/n8n:$VERSION. Is the version valid?"
+            exit 1
+          fi
+          echo "Pinned version: $VERSION @ $DIGEST"
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          # Create per-version branch via GitHub API (no local checkout — preserves workspace files)
+          BRANCH="n8n-$VERSION"
+          BRANCH_SHA="${{ github.sha }}"
+          EXISTING=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs/heads/$BRANCH")
+          if [ "$EXISTING" = "200" ]; then
+            echo "Branch $BRANCH already exists"
+          else
+            echo "Creating branch $BRANCH at $BRANCH_SHA"
+            curl -s -X POST \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/${{ github.repository }}/git/refs" \
+              -d "{\"ref\": \"refs/heads/$BRANCH\", \"sha\": \"$BRANCH_SHA\"}" | jq '.ref'
+          fi
+          echo "version_branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "version_branch_sha=$BRANCH_SHA" >> $GITHUB_OUTPUT
+
+          # Pull by immutable digest — guarantees what we scan is what we promote
+          docker pull n8nio/n8n@$DIGEST
+          docker tag n8nio/n8n@$DIGEST n8nio/n8n:$VERSION
+
+      - name: Scan Image for Secrets
+        run: |
+          trivy image \
+            --format table \
+            --scanners secret \
+            --severity CRITICAL,HIGH \
+            --exit-code 1 \
+            n8nio/n8n:${{ env.N8N_VERSION }}
+
+      - name: Scan Image for Malware (ClamAV)
+        run: |
+          echo "Exporting image to tarball for deep scanning..."
+          docker save n8nio/n8n:${{ env.N8N_VERSION }} -o image-for-clamav.tar
+          
+          echo "Running ClamAV malware scan via Docker container..."
+          chmod 644 image-for-clamav.tar
+          docker run --rm -v $(pwd):/scandir clamav/clamav:latest clamscan --max-filesize=4000M --max-scansize=4000M -r /scandir/image-for-clamav.tar || (echo "❌ Malware detected! Blocking promotion." && exit 1)
+          echo "✅ No malware detected."
+
+      - name: Scan Image for License Compliance
+        run: |
+          trivy image \
+            --format table \
+            --scanners license \
+            --severity CRITICAL,HIGH \
+            --exit-code 0 \
+            n8nio/n8n:${{ env.N8N_VERSION }}
+
+      - name: Scan for CVEs (non-blocking report)
+        run: |
+          # Scan ALL severities so KEV can cross-reference Medium/Low CVEs too
+          trivy image \
+            --format json \
+            --output trivy-report.raw.json \
+            --severity CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN \
+            n8nio/n8n:${{ env.N8N_VERSION }}
+
+          # Generate SARIF format for GitHub Security integration
+          trivy image \
+            --format sarif \
+            --output trivy-results.sarif \
+            --severity CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN \
+            n8nio/n8n:${{ env.N8N_VERSION }} || true
+
+      - name: Run Tracee reachability smoke test
+        run: |
+          chmod +x .github/scripts/collect_package_files.sh .github/scripts/run_tracee_reachability.sh
+          mkdir -p tracee-output
+          .github/scripts/collect_package_files.sh "n8nio/n8n:${{ env.N8N_VERSION }}" trivy-report.raw.json tracee-output/package-files.tsv
+          .github/scripts/run_tracee_reachability.sh "n8nio/n8n:${{ env.N8N_VERSION }}" "$PWD/tracee-output" "tracee-smoke-${{ github.run_id }}" 15678
+          python3 .github/scripts/merge_tracee_reachability.py \
+            trivy-report.raw.json \
+            tracee-output/package-files.tsv \
+            tracee-output/tracee-events.jsonl \
+            "$(cat tracee-output/target-container-id.txt)" \
+            trivy-report.tracee.json
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@b1bff81932f5cdfc8695c7752dcee935dcd061c8 # v4
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: "image-promotion-${{ env.N8N_VERSION }}"
+          ref: refs/heads/n8n-${{ env.N8N_VERSION }}
+          sha: ${{ steps.fetch-digest.outputs.version_branch_sha }}
+
+      - name: Enrich findings with KEV, EPSS, and age
+        id: enrich-findings
+        run: |
+          curl -s -o kev.json https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json
+          python3 .github/scripts/enrich_findings.py trivy-report.tracee.json kev.json trivy-report.json
+
+          echo "### Vulnerability Scan — n8nio/n8n:${{ env.N8N_VERSION }}" > trivy-summary.txt
+          echo "Pinned digest: ${{ steps.fetch-digest.outputs.digest }}" >> trivy-summary.txt
+          echo "" >> trivy-summary.txt
+          echo "#### Manual Review Findings (Critical/High with age, KEV, or EPSS trigger)" >> trivy-summary.txt
+          jq -r '[
+            .Results[]?.Vulnerabilities[]?
+            | select((.Severity=="CRITICAL" or .Severity=="HIGH") and .GateDecision=="MANUAL_REVIEW")
+            | "- \(.VulnerabilityID) (\(.Severity)) reachability=\(.Reachability) age=\((if .AgeDays == null then "unknown" else ((.AgeDays | tostring) + "d") end)) KEV=\(.KevHit) EPSS=\(.EpssPercent)% (\(.EpssRisk)) reasons=\((.GateReasons | join(",")))"
+          ] | if length > 0 then .[] else "None." end' trivy-report.json >> trivy-summary.txt
+
+          echo "" >> trivy-summary.txt
+          echo "---" >> trivy-summary.txt
+          echo "### Auto-Eligible Critical/High Findings" >> trivy-summary.txt
+          jq -r '[
+            .Results[]?.Vulnerabilities[]?
+            | select((.Severity=="CRITICAL" or .Severity=="HIGH") and .GateDecision=="AUTO_ALLOWED")
+            | "- \(.VulnerabilityID) (\(.Severity)) reachability=\(.Reachability) age=\((if .AgeDays == null then "unknown" else ((.AgeDays | tostring) + "d") end)) KEV=\(.KevHit) EPSS=\(.EpssPercent)% (\(.EpssRisk))"
+          ] | if length > 0 then .[] else "None." end' trivy-report.json >> trivy-summary.txt
+
+          echo "" >> trivy-summary.txt
+          echo "---" >> trivy-summary.txt
+          echo "### CISA KEV Check — Actively Exploited CVEs" >> trivy-summary.txt
+
+          KEV_HIT=false
+          jq -r '[
+            .Results[]?.Vulnerabilities[]?
+            | select(.KevHit == true)
+            | "- \(.VulnerabilityID) (\(.Severity)) EPSS=\(.EpssPercent)% (\(.EpssRisk))"
+          ] | if length > 0 then .[] else empty end' trivy-report.json >> trivy-summary.txt
+
+          if jq -e '[.Results[]?.Vulnerabilities[]? | select(.KevHit == true)] | length > 0' trivy-report.json > /dev/null; then
+            KEV_HIT=true
+          else
+            echo "✅ No CVEs match the CISA KEV catalogue." >> trivy-summary.txt
+          fi
+
+          MANUAL_REVIEW_COUNT=$(jq -r '.AnalysisSummary.manual_review_count // 0' trivy-report.json)
+          AUTO_ELIGIBLE_COUNT=$(jq -r '.AnalysisSummary.auto_allowed_critical_high_count // 0' trivy-report.json)
+          CRIT_HIGH_COUNT=$(jq -r '.AnalysisSummary.critical_high_count // 0' trivy-report.json)
+          AGE_REVIEW_COUNT=$(jq -r '.AnalysisSummary.older_than_30_days_count // 0' trivy-report.json)
+          EPSS_REVIEW_COUNT=$(jq -r '.AnalysisSummary.epss_high_or_critical_count // 0' trivy-report.json)
+          KEV_REVIEW_COUNT=$(jq -r '.AnalysisSummary.kev_critical_high_count // 0' trivy-report.json)
+          UNKNOWN_AGE_REVIEW_COUNT=$(jq -r '.AnalysisSummary.unknown_age_critical_high_count // 0' trivy-report.json)
+
+          echo "manual_review_count=$MANUAL_REVIEW_COUNT" >> $GITHUB_OUTPUT
+          echo "auto_eligible_count=$AUTO_ELIGIBLE_COUNT" >> $GITHUB_OUTPUT
+          echo "critical_high_count=$CRIT_HIGH_COUNT" >> $GITHUB_OUTPUT
+          echo "age_review_count=$AGE_REVIEW_COUNT" >> $GITHUB_OUTPUT
+          echo "epss_review_count=$EPSS_REVIEW_COUNT" >> $GITHUB_OUTPUT
+          echo "kev_review_count=$KEV_REVIEW_COUNT" >> $GITHUB_OUTPUT
+          echo "unknown_age_review_count=$UNKNOWN_AGE_REVIEW_COUNT" >> $GITHUB_OUTPUT
+          echo "kev_hit=$KEV_HIT" >> $GITHUB_OUTPUT
+          cat trivy-summary.txt
+
+      - name: Generate Enhanced Job Summary
+        if: always()
+        run: |
+          if [ ! -f trivy-report.json ]; then
+            echo "## 🛡️ Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+            echo "❌ No scan report found." >> $GITHUB_STEP_SUMMARY
+          else
+            python3 .github/scripts/generate_summary.py trivy-report.json kev.json "${{ env.N8N_VERSION }}"
+          fi
+          if [ -f vendor-sig-check.txt ]; then
+            cat vendor-sig-check.txt >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Generate OpenVEX Document
+        if: always()
+        run: |
+          if [ -f trivy-report.json ]; then
+            python3 .github/scripts/generate_vex.py trivy-report.json > vex.json
+            echo "✅ Generated VEX Document: vex.json" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Scan Report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: scan-report-${{ env.N8N_VERSION }}
+          path: |
+            trivy-report.json
+            trivy-summary.txt
+            vendor-sig-check.txt
+            kev.json
+            tracee-output/
+            vex.json
+
+      - name: Gate — Require approval only for aged, KEV, or high-EPSS critical/high CVEs
+        id: trivy-scan
+        run: |
+          MANUAL_REVIEW_COUNT="${{ steps.enrich-findings.outputs.manual_review_count }}"
+          CRIT_HIGH_COUNT="${{ steps.enrich-findings.outputs.critical_high_count }}"
+          AUTO_ELIGIBLE_COUNT="${{ steps.enrich-findings.outputs.auto_eligible_count }}"
+          KEV_HIT="${{ steps.enrich-findings.outputs.kev_hit }}"
+          KEV_REVIEW_COUNT="${{ steps.enrich-findings.outputs.kev_review_count }}"
+          AGE_REVIEW_COUNT="${{ steps.enrich-findings.outputs.age_review_count }}"
+          EPSS_REVIEW_COUNT="${{ steps.enrich-findings.outputs.epss_review_count }}"
+          UNKNOWN_AGE_REVIEW_COUNT="${{ steps.enrich-findings.outputs.unknown_age_review_count }}"
+
+          if [ "$MANUAL_REVIEW_COUNT" -gt 0 ]; then
+            echo "⚠️ Approval required: manual_review_count=$MANUAL_REVIEW_COUNT crit_high_count=$CRIT_HIGH_COUNT kev_hit=$KEV_HIT kev_review_count=$KEV_REVIEW_COUNT age_review_count=$AGE_REVIEW_COUNT epss_review_count=$EPSS_REVIEW_COUNT unknown_age_review_count=$UNKNOWN_AGE_REVIEW_COUNT"
+            echo "is_vulnerable=true" >> $GITHUB_OUTPUT
+          else
+            echo "✅ Auto-promotion enabled: crit_high_count=$CRIT_HIGH_COUNT auto_eligible_count=$AUTO_ELIGIBLE_COUNT kev_hit=$KEV_HIT"
+            echo "is_vulnerable=false" >> $GITHUB_OUTPUT
+          fi
+          exit 0
+
+      - name: Open GitHub Issue if vulnerable findings detected
+        if: steps.trivy-scan.outputs.is_vulnerable == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CRIT_HIGH="${{ steps.enrich-findings.outputs.critical_high_count }}"
+          MANUAL_REVIEW_COUNT="${{ steps.enrich-findings.outputs.manual_review_count }}"
+          KEV_REVIEW_COUNT="${{ steps.enrich-findings.outputs.kev_review_count }}"
+          AGE_REVIEW_COUNT="${{ steps.enrich-findings.outputs.age_review_count }}"
+          EPSS_REVIEW_COUNT="${{ steps.enrich-findings.outputs.epss_review_count }}"
+          UNKNOWN_AGE_REVIEW_COUNT="${{ steps.enrich-findings.outputs.unknown_age_review_count }}"
+          VERSION="${{ env.N8N_VERSION }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh label create security --color "FF0000" --force || true
+          cat << 'ISSUE_EOF' > issue_body.md
+          ## 🚨 Promotion Alert: Vulnerable Image Requires Review
+          ISSUE_EOF
+          cat >> issue_body.md << ISSUE_EOF
+
+          **Image:** n8n ${VERSION}
+          - **CRITICAL/HIGH CVEs:** ${CRIT_HIGH}
+          - **Findings requiring manual review:** ${MANUAL_REVIEW_COUNT}
+          - **CISA KEV-triggered CRITICAL/HIGH findings:** ${KEV_REVIEW_COUNT}
+          - **Age >= 30 days:** ${AGE_REVIEW_COUNT}
+          - **EPSS risk HIGH/CRITICAL:** ${EPSS_REVIEW_COUNT}
+          - **Unknown published age:** ${UNKNOWN_AGE_REVIEW_COUNT}
+
+          👉 [View Full Vulnerability Report (Workflow Run)](${RUN_URL})
+
+          **Action required:** Review the EPSS, KEV, and age-based findings in the scan artifact, then approve or deny promotion in the **trusted-promotion** environment gate.
+
+          ---
+          *Triggered by Image Promotion on $(date -u '+%Y-%m-%d')*
+          ISSUE_EOF
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "🚨 n8n $VERSION: manual review required by age/KEV/EPSS gate" \
+            --body-file issue_body.md \
+            --label "security"
+
+  promote-images-auto:
+    name: Auto Promotion (Clean Image)
+    needs: scan-images
+    if: needs.scan-images.outputs.is_vulnerable == 'false' && needs.scan-images.outputs.skip_promotion != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release jq
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -qq && sudo apt-get install -y trivy
+
+      - name: Pull by digest and push to GHCR
+        id: docker_push
+        run: |
+          # Pull the exact pinned digest resolved during the scan step
+          DIGEST="${{ needs.scan-images.outputs.image_digest }}"
+          docker pull n8nio/n8n@$DIGEST
+          TRUSTED_IMAGE="ghcr.io/${{ github.repository }}/n8n-trusted:${{ needs.scan-images.outputs.resolved_version }}"
+          docker tag n8nio/n8n@$DIGEST $TRUSTED_IMAGE
+          PUSH_OUTPUT=$(docker push $TRUSTED_IMAGE)
+          GHCR_DIGEST=$(echo "$PUSH_OUTPUT" | grep -oP 'sha256:[a-f0-9]+')
+          echo "GHCR digest: $GHCR_DIGEST"
+          echo "digest=$GHCR_DIGEST" >> $GITHUB_OUTPUT
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}/n8n-trusted
+          subject-digest: ${{ steps.docker_push.outputs.digest }}
+          push-to-registry: true
+          show-summary: false
+
+      - name: Generate SBOM with Trivy (spdx-json format, consistent with rescan)
+        run: |
+          # Use Trivy's own SBOM generation so rescan produces identical results
+          # (Syft/anchore-sbom-action uses different package discovery than Trivy)
+          trivy image \
+            --format spdx-json \
+            --output sbom.spdx.json \
+            n8nio/n8n:${{ needs.scan-images.outputs.resolved_version }}
+          echo "SBOM generated: $(jq '.packages | length' sbom.spdx.json) packages"
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@5026d3663739160db546203eeaffa6aa1c51a4d6 # v1
+        with:
+          subject-name: ghcr.io/${{ github.repository }}/n8n-trusted
+          subject-digest: ${{ steps.docker_push.outputs.digest }}
+          sbom-path: './sbom.spdx.json'
+          push-to-registry: true
+          show-summary: false
+
+      - name: Add Attestations Summary
+        run: |
+          echo "### 🛡️ Security Attestations" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **SLSA Build Provenance** and **SBOM** have been securely attested to the image digest \`${{ steps.docker_push.outputs.digest }}\`." >> $GITHUB_STEP_SUMMARY
+
+      - name: Create GitHub Release with rollback info
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        with:
+          files: |
+            ./sbom.spdx.json
+            ./trivy-report.json
+          tag_name: n8n-${{ needs.scan-images.outputs.resolved_version }}
+          name: "n8n ${{ needs.scan-images.outputs.resolved_version }} (Trusted)"
+          body: |
+            ## Trusted n8n Release — ${{ needs.scan-images.outputs.resolved_version }}
+
+            ### Image Reference (Digest-Pinned)
+            Pull by **immutable digest** for guaranteed integrity:
+            ```
+            docker pull ghcr.io/${{ github.repository }}/n8n-trusted@${{ steps.docker_push.outputs.digest }}
+            ```
+
+            Or by version tag:
+            ```
+            docker pull ghcr.io/${{ github.repository }}/n8n-trusted:${{ needs.scan-images.outputs.resolved_version }}
+            ```
+
+            ### Source
+            - Upstream: `n8nio/n8n@${{ needs.scan-images.outputs.image_digest }}`
+            - GHCR digest: `${{ steps.docker_push.outputs.digest }}`
+            - Trivy/Tracee Gate: ✅ Auto-promotion eligible under CVE age, KEV, EPSS, and runtime reachability reporting
+            - Full report: [`scan-report-${{ needs.scan-images.outputs.resolved_version }}`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            ### Rollback
+            Set these values in your `.env` file and run `docker compose up -d`:
+            ```
+            N8N_IMAGE_VERSION=${{ needs.scan-images.outputs.resolved_version }}
+            N8N_IMAGE_DIGEST=${{ steps.docker_push.outputs.digest }}
+            ```
+
+      - name: Prune old GitHub releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OLD_TAGS=$(gh release list \
+            --repo "${{ github.repository }}" \
+            --limit 50 \
+            --json tagName \
+            --jq '[.[].tagName | select(startswith("n8n-"))] | sort_by(sub("^n8n-"; "") | split(".") | map(tonumber)) | reverse | .[3:][]')
+
+          if [ -z "$OLD_TAGS" ]; then
+            echo "No old releases to prune."
+            exit 0
+          fi
+
+          for tag in $OLD_TAGS; do
+            echo "Deleting old release $tag"
+            gh release delete "$tag" --repo "${{ github.repository }}" --cleanup-tag -y
+          done
+
+  promote-images-manual:
+    name: Manual Approval Promotion (Vulnerable Image)
+    needs: scan-images
+    if: needs.scan-images.outputs.is_vulnerable == 'true' && needs.scan-images.outputs.skip_promotion != 'true'
+    runs-on: ubuntu-latest
+    environment: trusted-promotion
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release jq
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -qq && sudo apt-get install -y trivy
+
+      - name: Pull by digest and push to GHCR
+        id: docker_push
+        run: |
+          DIGEST="${{ needs.scan-images.outputs.image_digest }}"
+          docker pull n8nio/n8n@$DIGEST
+          TRUSTED_IMAGE="ghcr.io/${{ github.repository }}/n8n-trusted:${{ needs.scan-images.outputs.resolved_version }}"
+          docker tag n8nio/n8n@$DIGEST $TRUSTED_IMAGE
+          PUSH_OUTPUT=$(docker push $TRUSTED_IMAGE)
+          GHCR_DIGEST=$(echo "$PUSH_OUTPUT" | grep -oP 'sha256:[a-f0-9]+')
+          echo "GHCR digest: $GHCR_DIGEST"
+          echo "digest=$GHCR_DIGEST" >> $GITHUB_OUTPUT
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}/n8n-trusted
+          subject-digest: ${{ steps.docker_push.outputs.digest }}
+          push-to-registry: true
+          show-summary: false
+
+      - name: Generate SBOM with Trivy (spdx-json format, consistent with rescan)
+        run: |
+          trivy image \
+            --format spdx-json \
+            --output sbom.spdx.json \
+            n8nio/n8n:${{ needs.scan-images.outputs.resolved_version }}
+          echo "SBOM generated: $(jq '.packages | length' sbom.spdx.json) packages"
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@5026d3663739160db546203eeaffa6aa1c51a4d6 # v1
+        with:
+          subject-name: ghcr.io/${{ github.repository }}/n8n-trusted
+          subject-digest: ${{ steps.docker_push.outputs.digest }}
+          sbom-path: './sbom.spdx.json'
+          push-to-registry: true
+          show-summary: false
+
+      - name: Add Attestations Summary
+        run: |
+          echo "### 🛡️ Security Attestations" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **SLSA Build Provenance** and **SBOM** have been securely attested to the image digest \`${{ steps.docker_push.outputs.digest }}\`." >> $GITHUB_STEP_SUMMARY
+
+      - name: Create GitHub Release with rollback info
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        with:
+          files: |
+            ./sbom.spdx.json
+            ./trivy-report.json
+          tag_name: n8n-${{ needs.scan-images.outputs.resolved_version }}
+          name: "n8n ${{ needs.scan-images.outputs.resolved_version }} (Manually Approved — Vulnerabilities Present)"
+          body: |
+            ## ⚠️ n8n ${{ needs.scan-images.outputs.resolved_version }} — Manually Approved
+
+            This version was promoted **after manual review under the CVE age, KEV, EPSS, and runtime reachability policy**.
+            Full scan report: [`scan-report-${{ needs.scan-images.outputs.resolved_version }}`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            ### Image Reference (Digest-Pinned)
+            ```
+            docker pull ghcr.io/${{ github.repository }}/n8n-trusted@${{ steps.docker_push.outputs.digest }}
+            ```
+
+            Or by version tag:
+            ```
+            docker pull ghcr.io/${{ github.repository }}/n8n-trusted:${{ needs.scan-images.outputs.resolved_version }}
+            ```
+
+            ### Source
+            - Upstream: `n8nio/n8n@${{ needs.scan-images.outputs.image_digest }}`
+            - GHCR digest: `${{ steps.docker_push.outputs.digest }}`
+
+            ### Rollback
+            Set these values in your `.env` file and run `docker compose up -d`:
+            ```
+            N8N_IMAGE_VERSION=${{ needs.scan-images.outputs.resolved_version }}
+            N8N_IMAGE_DIGEST=${{ steps.docker_push.outputs.digest }}
+            ```
+
+      - name: Prune old GitHub releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OLD_TAGS=$(gh release list \
+            --repo "${{ github.repository }}" \
+            --limit 50 \
+            --json tagName \
+            --jq '[.[].tagName | select(startswith("n8n-"))] | sort_by(sub("^n8n-"; "") | split(".") | map(tonumber)) | reverse | .[3:][]')
+
+          if [ -z "$OLD_TAGS" ]; then
+            echo "No old releases to prune."
+            exit 0
+          fi
+
+          for tag in $OLD_TAGS; do
+            echo "Deleting old release $tag"
+            gh release delete "$tag" --repo "${{ github.repository }}" --cleanup-tag -y
+          done

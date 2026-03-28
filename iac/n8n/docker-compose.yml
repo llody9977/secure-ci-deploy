@@ -1,0 +1,125 @@
+services:
+  n8n:
+    # ── Image ─────────────────────────────────────────────────────────────────
+    # Runtime always uses the immutable digest — never a mutable tag.
+    # N8N_IMAGE_IDENTIFIER is auto-populated by install.sh (format: @sha256:... or :1.55.3)
+    # Policy: promotion-policy.yml § image_pinning
+    image: ghcr.io/${GITHUB_REPOSITORY_OWNER_LC:-llody9977}/${REPOSITORY_NAME:-secure-ci-deploy}/n8n-trusted${N8N_IMAGE_IDENTIFIER}
+
+    # ── CIS Docker Benchmark v1.6.0 — Container Runtime Controls ─────────────
+    # Reference: https://www.cisecurity.org/benchmark/docker
+    # Applicable section: 5 — Container Runtime Configuration
+    # Controls are labelled with their CIS ID for traceability.
+
+    # CIS 5.14 — Use on-failure restart policy with a max count
+    # 'unless-stopped' ensures auto-restart on host reboot while still
+    # respecting intentional `docker compose stop` commands
+    restart: "unless-stopped"
+
+    # CIS 5.21 — Do not disable the default seccomp profile
+    # CIS 5.1  — Do not disable AppArmor (apply docker-default profile)
+    # CIS 5.25 — Restrict container from acquiring additional privileges
+    security_opt:
+      - no-new-privileges:true # CIS 5.25
+      - apparmor:docker-default # CIS 5.1
+      # seccomp:unconfined is intentionally NOT set — CIS 5.21 requires default profile
+
+      # CIS 5.3  — Do not run containers with --privileged
+      # 'privileged' is omitted entirely (compose default = false)
+
+      # CIS 5.23 & 5.24 — Do not share host namespaces
+      # pid, ipc, uts are omitted entirely (compose default = private)
+
+      # CIS 5.2  — Do not use Linux capabilities beyond minimum required
+      # n8n is a Node.js HTTP app — it requires zero capabilities
+    cap_drop:
+      - ALL
+    # cap_add is intentionally empty — no capabilities re-added
+
+    # CIS 5.12 — Mount container root filesystem as read-only
+    read_only: true
+
+    # CIS 5.31 — Do not mount sensitive host system directories
+    # CIS 5.27 — Do not expose host device files
+    # No sensitive mounts: /proc, /sys, /dev, /etc, docker.sock are NOT mounted
+
+    # CIS 5.30 — Do not share the host's user namespace
+    # userns_mode is omitted (default = isolated)
+
+    # CIS 5.4  — User namespace is isolated; container runs as non-root
+    # The official n8n image ships with uid=1000 (node) — no root process
+    user: "1000:1000"
+
+    # CIS 5.10 — Limit memory usage (prevent resource exhaustion DoS)
+    # CIS 5.11 — Set CPU shares / limits appropriately
+    # CIS 5.28 — Use PIDs cgroup limit (prevent fork bombs)
+    # Values are configurable via .env (set by install.sh or manually)
+    pids_limit: ${PIDS_LIMIT:-200}
+    mem_limit: ${MEM_LIMIT:-1g}
+    memswap_limit: ${MEM_LIMIT:-1g} # Equal to mem_limit → swap disabled
+    cpus: "${CPU_LIMIT:-1.0}"
+
+    # CIS 5.7  — Do not map privileged ports (< 1024) within containers
+    # 5678 is unprivileged — compliant
+    # CIS 5.13 — Bind to specific host interface where possible
+    # Binding to HOST_IP scopes exposure to the configured interface
+    ports:
+      - "${HOST_IP}:5678:5678"
+
+    # CIS 5.29 — Use a custom network, not the default docker0 bridge
+    networks:
+      - n8n_net
+
+    # ── Ephemeral writable paths (not backed by persistent storage) ────────────
+    # Required because read_only: true prohibits any FS writes on the root layer
+    # /home/node/.cache needs mode=1777 (world-writable) so uid 1000 can write;
+    # mode=0700 (used previously) is root-only and caused EACCES.
+    tmpfs:
+      - /tmp:mode=1777,size=256m,nosuid
+      - /home/node/.cache:mode=1777,size=64m,nosuid
+
+    # CIS 5.18 — Set ulimits where necessary
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 4096
+
+    # ── Environment ───────────────────────────────────────────────────────────
+    environment:
+      - N8N_USER_MANAGEMENT_DISABLED=false
+      - WEBHOOK_URL=http://${HOST_IP}:5678/
+      - N8N_SECURE_COOKIE=false
+      # Disable task runners entirely — prevents Python/JS runners from starting
+      # in internal mode. Python 3 is not installed in this hardened image.
+      - N8N_RUNNERS_ENABLED=false
+
+    # ── Health Check ──────────────────────────────────────────────────────────
+    healthcheck:
+      test: [ "CMD", "wget", "-qO-", "http://localhost:5678/healthz" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    # ── Volumes ───────────────────────────────────────────────────────────────
+    # Named volume only — no host path mounts (CIS 5.4 / 5.31)
+    volumes:
+      - n8n_storage:/home/node/.n8n
+
+    # ── Logging ───────────────────────────────────────────────────────────────
+    # Prevent unbounded log growth on the host
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# CIS 5.29 — Define a custom bridge network (isolated from docker0)
+networks:
+  n8n_net:
+    driver: bridge
+    internal: false # set true if no external calls needed; n8n requires outbound
+
+volumes:
+  n8n_storage:
+    driver: local

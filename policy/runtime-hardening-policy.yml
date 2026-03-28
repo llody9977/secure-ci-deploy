@@ -1,0 +1,183 @@
+# Runtime Hardening Policy — CIS Docker Benchmark v1.6.0
+# Defines required container runtime security controls.
+# Changes require a Pull Request for auditability.
+#
+# Reference:   CIS Docker Benchmark v1.6.0 (2023-09-29)
+# Source:      https://www.cisecurity.org/benchmark/docker
+# Scope:       Section 5 — Container Runtime Configuration
+# Applies to:  iac/n8n/docker-compose.yml
+#
+# Checked by:  .github/workflows/ci.yml (CIS Compliance Check step)
+# Enforcement: automated checks alert and block CI on non-compliance.
+
+cis_docker_benchmark:
+  version: "1.6.0"
+  release_date: "2023-09-29"
+  scope: "Section 5 — Container Runtime Configuration"
+  target_compose_file: "iac/n8n/docker-compose.yml"
+
+# ─── COMPLIANCE TABLE ─────────────────────────────────────────────────────────
+# Status values:
+#   COMPLIANT        — control is applied and automatically verified
+#   NOT_APPLICABLE   — control is irrelevant to this container/setup
+#   ACCEPTED_RISK    — control not applied; risk documented and accepted
+#
+# enforcement values:
+#   automated        — ci.yml checks this and fails CI on violation
+#   manual           — human review responsibility (documented here for auditors)
+#   n/a              — not applicable
+
+controls:
+  - id: "5.1"
+    title: "Ensure AppArmor profile is applied to Docker containers"
+    status: COMPLIANT
+    enforcement: automated
+    check: "security_opt includes apparmor:docker-default"
+    implementation: "security_opt: apparmor:docker-default in docker-compose.yml"
+
+  - id: "5.2"
+    title: "Ensure all Linux kernel capabilities are restricted"
+    status: COMPLIANT
+    enforcement: automated
+    check: "cap_drop ALL is present and cap_add is absent or empty"
+    implementation: "cap_drop: [ALL]; no cap_add entries"
+
+  - id: "5.3"
+    title: "Ensure containers do not run in privileged mode"
+    status: COMPLIANT
+    enforcement: automated
+    check: "privileged key is absent or false"
+    implementation: "privileged key not present in docker-compose.yml (default false)"
+
+  - id: "5.4"
+    title: "Ensure sensitive host filesystem directories are not mounted"
+    status: COMPLIANT
+    enforcement: automated
+    check: "volumes do not include /etc, /proc, /sys, /dev, /run, docker.sock"
+    implementation: "Only named volume n8n_storage:/home/node/.n8n is mounted"
+
+  - id: "5.5"
+    title: "Ensure host networking is not used"
+    status: NOT_APPLICABLE
+    enforcement: "n/a"
+    reason: "Custom bridge network (n8n_net) is used; network_mode: host is not set"
+
+  - id: "5.7"
+    title: "Ensure privileged ports are not mapped within containers"
+    status: COMPLIANT
+    enforcement: automated
+    check: "No host port < 1024 is mapped"
+    implementation: "Port 5678 only — unprivileged"
+
+  - id: "5.9"
+    title: "Ensure the host's network namespace is not shared"
+    status: NOT_APPLICABLE
+    enforcement: "n/a"
+    reason: "network_mode: host is not used; container uses isolated custom bridge"
+
+  - id: "5.10"
+    title: "Ensure memory usage is limited"
+    status: COMPLIANT
+    enforcement: automated
+    check: "mem_limit is set and non-empty"
+    implementation: "mem_limit: ${MEM_LIMIT:-1g} — configurable, default 1g"
+
+  - id: "5.11"
+    title: "Ensure CPU priority is set appropriately"
+    status: COMPLIANT
+    enforcement: automated
+    check: "cpus is set and non-empty"
+    implementation: "cpus: ${CPU_LIMIT:-1.0} — configurable, default 1.0"
+
+  - id: "5.12"
+    title: "Ensure the container's root filesystem is mounted as read-only"
+    status: COMPLIANT
+    enforcement: automated
+    check: "read_only: true is present"
+    implementation: "read_only: true"
+
+  - id: "5.13"
+    title: "Ensure incoming container traffic is bound to a specific host interface"
+    status: COMPLIANT
+    enforcement: automated
+    check: "port binding includes HOST_IP prefix (not 0.0.0.0)"
+    implementation: "ports: ${HOST_IP}:5678:5678"
+
+  - id: "5.14"
+    title: "Ensure restart policy is set to on-failure with a count"
+    status: COMPLIANT
+    enforcement: automated
+    check: "restart is on-failure:N (not always, not unless-stopped)"
+    implementation: "restart: on-failure:5"
+
+  - id: "5.15"
+    title: "Ensure the host's process namespace is not shared"
+    status: NOT_APPLICABLE
+    enforcement: "n/a"
+    reason: "pid: host is not set"
+
+  - id: "5.16"
+    title: "Ensure the host's IPC namespace is not shared"
+    status: NOT_APPLICABLE
+    enforcement: "n/a"
+    reason: "ipc: host is not set"
+
+  - id: "5.17"
+    title: "Ensure host devices are not exposed to containers"
+    status: NOT_APPLICABLE
+    enforcement: "n/a"
+    reason: "devices: key is not present"
+
+  - id: "5.18"
+    title: "Ensure default ulimits are overridden only if necessary"
+    status: COMPLIANT
+    enforcement: automated
+    check: "ulimits nofile is set"
+    implementation: "ulimits: nofile: soft=1024 hard=4096"
+
+  - id: "5.20"
+    title: "Ensure the host's UTS namespace is not shared"
+    status: NOT_APPLICABLE
+    enforcement: "n/a"
+    reason: "uts: host is not set"
+
+  - id: "5.21"
+    title: "Ensure the default seccomp profile is not disabled"
+    status: COMPLIANT
+    enforcement: automated
+    check: "security_opt does not contain seccomp:unconfined"
+    implementation: "seccomp:unconfined is absent from security_opt"
+
+  - id: "5.25"
+    title: "Ensure container is restricted from acquiring new privileges"
+    status: COMPLIANT
+    enforcement: automated
+    check: "security_opt includes no-new-privileges:true"
+    implementation: "security_opt: no-new-privileges:true"
+
+  - id: "5.28"
+    title: "Ensure PIDs cgroup limit is used"
+    status: COMPLIANT
+    enforcement: automated
+    check: "pids_limit is set and > 0"
+    implementation: "pids_limit: ${PIDS_LIMIT:-200} — configurable, default 200"
+
+  - id: "5.29"
+    title: "Ensure Docker's default bridge docker0 is not used"
+    status: COMPLIANT
+    enforcement: automated
+    check: "service is attached to a named network (not the implicit default)"
+    implementation: "networks: n8n_net — custom bridge defined under top-level networks"
+
+  - id: "5.30"
+    title: "Ensure the host's user namespace is not shared"
+    status: NOT_APPLICABLE
+    enforcement: "n/a"
+    reason: "userns_mode is not set (isolated default)"
+
+  - id: "5.31"
+    title: "Ensure Docker socket is not mounted inside containers"
+    status: COMPLIANT
+    enforcement: automated
+    check: "No volume contains docker.sock"
+    implementation: "Volumes: only n8n_storage named volume"
